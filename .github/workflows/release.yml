@@ -1,0 +1,58 @@
+name: Build and release ZhukoGPT
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Check sources
+        run: python -m py_compile ZhukoGPT.py make_icon.py zhukogpt/__init__.py zhukogpt/api.py zhukogpt/config.py zhukogpt/hotkeys.py zhukogpt/logo.py zhukogpt/main.py zhukogpt/overlay.py zhukogpt/settings_dialog.py zhukogpt/winapi.py zhukogpt/window.py
+
+      - name: Draw icon
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python make_icon.py
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --onefile --noconsole --name ZhukoGPT --icon assets/zhukogpt.ico ZhukoGPT.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist/ZhukoGPT.exe release/
+          Copy-Item README.md release/
+          Compress-Archive -Path release/* -DestinationPath ZhukoGPT-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZhukoGPT-windows
+          path: |
+            dist/ZhukoGPT.exe
+            ZhukoGPT-windows.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ZhukoGPT ${{ github.ref_name }}
+          body_path: .github/release-notes.md
+          files: |
+            dist/ZhukoGPT.exe
+            ZhukoGPT-windows.zip

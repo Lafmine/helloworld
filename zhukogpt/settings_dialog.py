@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 
 from . import winapi
 from .api import ModelsWorker
-from .config import HOTKEY_ACTIONS
+from .config import HOTKEY_ACTIONS, VERSION
 from .hotkeys import parse_hotkey
 from .window import BORDER_COLOR, RADIUS
 
@@ -53,7 +53,7 @@ class SettingsDialog(QDialog):
         root.setContentsMargins(20, 14, 20, 16)
         root.setSpacing(10)
 
-        root.addWidget(QLabel("⚙  Настройки", objectName="title"))
+        root.addWidget(QLabel(f"⚙  Настройки  <span style='font-size:9pt;color:#a9c8f0'>v{VERSION}</span>", objectName="title"))
 
         form = QFormLayout()
         form.setHorizontalSpacing(12)
@@ -74,7 +74,7 @@ class SettingsDialog(QDialog):
             lambda on: self.key_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
         key_row.addWidget(self.key_edit, 1)
         key_row.addWidget(btn_eye)
-        form.addRow("API-ключ:", key_row)
+        form.addRow("API-ключ OpenRouter:", key_row)
         key_hint = QLabel('Бесплатный ключ: <a style="color:#8fd8ff" href="https://openrouter.ai/keys">openrouter.ai/keys</a>',
                           objectName="hint")
         key_hint.setOpenExternalLinks(True)
@@ -128,6 +128,9 @@ class SettingsDialog(QDialog):
         buttons.addWidget(btn_cancel)
         buttons.addWidget(btn_save)
         root.addLayout(buttons)
+
+        if not self.key_edit.text():
+            self.key_edit.setFocus()
 
     # --- модели ---
     def _fill_models(self, models, current):

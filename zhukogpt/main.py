@@ -39,6 +39,9 @@ class ZhukoApp:
         self.window.show()
         self._register_hotkeys()
         self._show_welcome()
+        if not self.cfg.get("api_key"):
+            # Первый запуск: без ключа OpenRouter работать нельзя — сразу открываем настройки.
+            QTimer.singleShot(300, self.open_settings)
 
     # --- хоткеи ---
     def _register_hotkeys(self):
@@ -81,6 +84,11 @@ class ZhukoApp:
 
     def take_screenshot(self):
         if self.selector is not None:
+            return
+        if not self.cfg.get("api_key"):
+            self._restore_window()
+            self.window.show_error("Сначала вставь API-ключ OpenRouter в настройках ⚙.")
+            self.open_settings()
             return
         # Если окно не скрыто от захвата — прячем его на время снимка.
         must_hide = self.window.isVisible() and not self.window.capture_hidden_ok
