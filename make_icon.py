@@ -8,6 +8,8 @@ from zhukogpt.logo import beetle_pixmap
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")  # консоль без UTF-8 не должна ронять сборку
     app = QGuiApplication(sys.argv)  # noqa: F841 — QPixmap требует приложение
     out = Path(__file__).parent / "assets"
     out.mkdir(exist_ok=True)
