@@ -171,8 +171,8 @@ class MainWindow(QWidget):
     def set_status(self, text):
         self.status.setText(text)
 
-    def set_busy(self, model):
-        self._busy_model = model.split("/")[-1]
+    def set_busy(self, model, note=""):
+        self._busy_model = model.split("/")[-1] + (f" ({note})" if note else "")
         self._dots = 0
         self.btn_copy.setEnabled(False)
         self._busy_timer.start()

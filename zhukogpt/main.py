@@ -141,15 +141,21 @@ class ZhukoApp:
             return
         self.last_png = png
         model = self.cfg["model"]
+        # Выбранная модель первой, остальные из списка — запасные при перегрузке провайдера.
+        models = [model] + [m for m in self.cfg.get("models", []) if m != model]
         self.window.set_busy(model)
-        self.worker = AskWorker(self.cfg.get("api_key", ""), model, png)
+        self.worker = AskWorker(self.cfg.get("api_key", ""), models, png)
+        self.worker.trying.connect(self._on_trying)
         self.worker.finished_ok.connect(self._on_answer)
         self.worker.failed.connect(self._on_error)
         self.worker.start()
 
-    def _on_answer(self, text):
+    def _on_trying(self, model):
+        self.window.set_busy(model, note="прошлая модель занята, пробую другую")
+
+    def _on_answer(self, text, model):
         self.window.show_answer(text)
-        self.window.set_status(f"Готово • {self.cfg['model'].split('/')[-1]}")
+        self.window.set_status(f"Готово • {model.split('/')[-1]}")
 
     def _on_error(self, text):
         self.window.show_error(text)

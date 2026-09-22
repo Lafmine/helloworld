@@ -1,4 +1,6 @@
 """Окно настроек в том же «стеклянном» стиле."""
+import html
+
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
@@ -7,7 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import winapi
-from .api import ModelsWorker
+from .api import KeyWorker, ModelsWorker, describe_key
 from .config import HOTKEY_ACTIONS, VERSION
 from .hotkeys import parse_hotkey
 from .window import BORDER_COLOR, RADIUS
@@ -38,6 +40,10 @@ QCheckBox::indicator { width: 16px; height: 16px; }
 """
 
 
+KEY_HINT = ('Бесплатный ключ: <a style="color:#8fd8ff" href="https://openrouter.ai/keys">'
+            'openrouter.ai/keys</a>')
+
+
 class SettingsDialog(QDialog):
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
@@ -48,6 +54,7 @@ class SettingsDialog(QDialog):
         self._cfg = cfg
         self._drag_offset = None
         self._models_worker = None
+        self._key_worker = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 14, 20, 16)
@@ -72,13 +79,17 @@ class SettingsDialog(QDialog):
         btn_eye.setFixedWidth(38)
         btn_eye.toggled.connect(
             lambda on: self.key_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
+        self.btn_check = QPushButton("Проверить")
+        self.btn_check.setToolTip("Проверить ключ и остаток бесплатных запросов на сегодня")
+        self.btn_check.clicked.connect(self._check_key)
         key_row.addWidget(self.key_edit, 1)
         key_row.addWidget(btn_eye)
+        key_row.addWidget(self.btn_check)
         form.addRow("API-ключ OpenRouter:", key_row)
-        key_hint = QLabel('Бесплатный ключ: <a style="color:#8fd8ff" href="https://openrouter.ai/keys">openrouter.ai/keys</a>',
-                          objectName="hint")
-        key_hint.setOpenExternalLinks(True)
-        form.addRow("", key_hint)
+        self.key_hint = QLabel(KEY_HINT, objectName="hint")
+        self.key_hint.setOpenExternalLinks(True)
+        self.key_hint.setWordWrap(True)
+        form.addRow("", self.key_hint)
 
         # Модель
         model_row = QHBoxLayout()
@@ -131,6 +142,19 @@ class SettingsDialog(QDialog):
 
         if not self.key_edit.text():
             self.key_edit.setFocus()
+
+    # --- проверка ключа ---
+    def _check_key(self):
+        self.btn_check.setEnabled(False)
+        self.key_hint.setText("Проверяю ключ…")
+        self._key_worker = KeyWorker(self.key_edit.text().strip(), self)
+        self._key_worker.finished_ok.connect(self._key_checked)
+        self._key_worker.start()
+
+    def _key_checked(self, info):
+        self.btn_check.setEnabled(True)
+        color = {True: "#9df0b0", False: "#ffb4b4"}.get(info.get("valid"), "#ffe08a")
+        self.key_hint.setText(f'<span style="color:{color}">{html.escape(describe_key(info))}</span>')
 
     # --- модели ---
     def _fill_models(self, models, current):
