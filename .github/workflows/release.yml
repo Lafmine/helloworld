@@ -1,8 +1,12 @@
 name: Build and release ZhukoGPT
 
+# Релиз публикуется для версии из zhukogpt/config.py (VERSION). Повторный пуш той же
+# версии обновляет файлы релиза; для нового релиза подними VERSION.
 on:
   push:
+    branches: [main, claude/zhukogpt-ai-assistant-flzt2a]
     tags: ["v*"]
+    paths-ignore: [".gitignore", ".gitattributes"]
   workflow_dispatch:
 
 permissions:
@@ -54,7 +58,7 @@ jobs:
             dist/ZhukoGPT.exe
             ZhukoGPT-windows.zip
 
-      # Тег v* публикует релиз с этим тегом; ручной запуск сам создаёт тег v<VERSION>.
+      # Тег v* публикует релиз с этим тегом; пуш в ветку сам создаёт тег v<VERSION>.
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
