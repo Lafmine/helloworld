@@ -22,6 +22,7 @@ class ZhukoApp:
         self.cfg = config.load()
         self.last_png = None
         self.worker = None
+        self._old_workers = []  # остановленные запросы, которые ещё дозакрываются в фоне
         self.selector = None
         self.settings_open = False
         self._was_visible = True
@@ -31,6 +32,7 @@ class ZhukoApp:
         self.window.place(self.cfg.get("geometry"))
         self.window.settings_requested.connect(self.open_settings)
         self.window.quit_requested.connect(self.quit)
+        self.window.stop_requested.connect(self.stop_request)
         self.window.geometry_changed.connect(self._save_geometry)
 
         self.hotkeys = HotkeyManager(app)
@@ -137,7 +139,7 @@ class ZhukoApp:
 
     def send(self, png):
         if self.worker is not None and self.worker.isRunning():
-            self.window.set_status("Подожди, ещё думаю над прошлым скриншотом…")
+            self.window.set_status("Ещё думаю над прошлым скриншотом — подожди или нажми «Стоп»")
             return
         self.last_png = png
         model = self.cfg["model"]
@@ -148,7 +150,26 @@ class ZhukoApp:
         self.worker.trying.connect(self._on_trying)
         self.worker.finished_ok.connect(self._on_answer)
         self.worker.failed.connect(self._on_error)
+        self.worker.cancelled.connect(self._on_cancelled_request)
         self.worker.start()
+
+    def stop_request(self):
+        worker = self.worker
+        if worker is None or not worker.isRunning():
+            return
+        # Отвязываем поток сразу: окно освобождается мгновенно, а соединение закрывается в фоне.
+        worker.cancel()
+        for sig in (worker.trying, worker.finished_ok, worker.failed, worker.cancelled):
+            sig.disconnect()
+        self._old_workers.append(worker)
+        worker.finished.connect(lambda w=worker: self._old_workers.remove(w))
+        self.worker = None
+        self._on_cancelled_request()
+
+    def _on_cancelled_request(self):
+        self.window.show_message("Запрос остановлен. Можно сделать новый скриншот или нажать "
+                                 f"**{self.cfg['hotkeys'].get('repeat', '')}**, чтобы повторить.")
+        self.window.set_status(self._ready_text())
 
     def _on_trying(self, model):
         self.window.set_busy(model, note="прошлая модель занята, пробую другую")
@@ -189,7 +210,7 @@ class ZhukoApp:
         g = self.window.geometry()
         self.cfg["geometry"] = [g.x(), g.y(), g.width(), g.height()]
         config.save(self.cfg)
-        if self.worker is not None and self.worker.isRunning():
+        if any(w.isRunning() for w in [self.worker, *self._old_workers] if w is not None):
             # Запрос к ИИ ещё висит — не ждём его, а сразу завершаем процесс.
             os._exit(0)
         self.app.quit()

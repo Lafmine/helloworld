@@ -1,4 +1,6 @@
 """Главное окно: полупрозрачная синяя закруглённая панель поверх всех окон."""
+import time
+
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
@@ -27,6 +29,11 @@ QPushButton#copy {
     border-radius: 9px; padding: 5px 12px;
 }
 QPushButton#copy:hover { background: rgba(255,255,255,0.22); }
+QPushButton#stop {
+    background: rgba(255,90,90,0.25); border: 1px solid rgba(255,150,150,0.5);
+    border-radius: 9px; padding: 5px 12px;
+}
+QPushButton#stop:hover { background: rgba(255,90,90,0.45); }
 QPushButton#copy:disabled { color: rgba(234,244,255,0.4); }
 QTextBrowser {
     background: rgba(5,20,55,0.35); border: 1px solid rgba(160,210,255,0.2);
@@ -42,6 +49,7 @@ QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: trans
 class MainWindow(QWidget):
     settings_requested = Signal()
     quit_requested = Signal()
+    stop_requested = Signal()
     geometry_changed = Signal(list)
 
     def __init__(self, hide_from_capture=True):
@@ -101,8 +109,14 @@ class MainWindow(QWidget):
         self.btn_copy.setFocusPolicy(Qt.NoFocus)
         self.btn_copy.setEnabled(False)
         self.btn_copy.clicked.connect(self._copy)
+        self.btn_stop = QPushButton("Стоп", objectName="stop", toolTip="Остановить запрос")
+        self.btn_stop.setCursor(Qt.PointingHandCursor)
+        self.btn_stop.setFocusPolicy(Qt.NoFocus)
+        self.btn_stop.clicked.connect(self.stop_requested)
+        self.btn_stop.hide()
         bottom.addWidget(self.status, 1)
         bottom.addWidget(self.btn_copy)
+        bottom.addWidget(self.btn_stop)
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
         root.addLayout(bottom)
 
@@ -174,29 +188,40 @@ class MainWindow(QWidget):
     def set_busy(self, model, note=""):
         self._busy_model = model.split("/")[-1] + (f" ({note})" if note else "")
         self._dots = 0
-        self.btn_copy.setEnabled(False)
+        self._busy_since = time.monotonic()
+        self._set_busy_buttons(True)
         self._busy_timer.start()
         self._tick_busy()
 
+    def _set_busy_buttons(self, busy):
+        self.btn_copy.setVisible(not busy)
+        self.btn_stop.setVisible(busy)
+        if busy:
+            self.btn_copy.setEnabled(False)
+
     def _tick_busy(self):
         self._dots = (self._dots + 1) % 4
-        self.view.setMarkdown(f"### 🪲 Думаю{'.' * self._dots}")
+        seconds = int(time.monotonic() - self._busy_since)
+        self.view.setMarkdown(f"### 🪲 Думаю{'.' * self._dots}  {seconds} с")
         self.set_status(f"Модель: {self._busy_model}")
 
     def show_answer(self, text):
         self._busy_timer.stop()
+        self._set_busy_buttons(False)
         self._answer_text = text
         self.view.setMarkdown(text)
         self.btn_copy.setEnabled(True)
 
     def show_error(self, text):
         self._busy_timer.stop()
+        self._set_busy_buttons(False)
         self._answer_text = ""
         self.view.setMarkdown(f"**⚠ Ошибка**\n\n{text}")
         self.btn_copy.setEnabled(False)
 
     def show_message(self, markdown):
         self._busy_timer.stop()
+        self._set_busy_buttons(False)
         self.view.setMarkdown(markdown)
 
     def _copy(self):

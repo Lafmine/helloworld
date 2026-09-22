@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 DEFAULT_MODELS = [
     "qwen/qwen3.8-27b:free",

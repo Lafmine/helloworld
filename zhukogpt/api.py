@@ -1,5 +1,8 @@
 """Работа с OpenRouter."""
 import base64
+import json
+import threading
+import time
 from datetime import datetime
 
 import requests
@@ -11,7 +14,9 @@ from .config import APP_NAME, SYSTEM_PROMPT, USER_PROMPT
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 KEY_URL = "https://openrouter.ai/api/v1/key"
-TIMEOUT = 120
+CONNECT_TIMEOUT = 15
+READ_TIMEOUT = 20  # сколько сервер может молчать совсем без байтов
+MODEL_DEADLINE = 45  # секунд на одну модель, потом — следующая
 MAX_FALLBACKS = 2  # сколько запасных моделей пробовать после выбранной
 MAX_IMAGE_SIDE = 1600
 
@@ -60,6 +65,8 @@ def build_payload(model: str, png_bytes: bytes) -> dict:
                 ],
             },
         ],
+        # «Думающие» модели рассуждают короче, а текст рассуждений не попадает в ответ.
+        "reasoning": {"effort": "low", "exclude": True},
     }
 
 
@@ -136,23 +143,89 @@ def classify_error(status, error: dict, headers=None) -> ApiError:
     return ApiError("other", f"Ошибка OpenRouter ({status}).", detail, status)
 
 
-def _ask_once(api_key: str, model: str, png_bytes: bytes) -> str:
+class _Request:
+    """Текущий HTTP-ответ, чтобы его можно было закрыть из другого потока при отмене."""
+
+    def __init__(self):
+        self.cancel_event = threading.Event()
+        self._resp = None
+        self._lock = threading.Lock()
+
+    def set(self, resp):
+        with self._lock:
+            self._resp = resp
+        if self.cancel_event.is_set():
+            self.close()
+
+    def close(self):
+        with self._lock:
+            resp, self._resp = self._resp, None
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    def cancel(self):
+        self.cancel_event.set()
+        self.close()
+
+
+def _check_cancel(req):
+    if req is not None and req.cancel_event.is_set():
+        raise ApiError("cancelled", "Остановлено.")
+
+
+def _read_body(resp, deadline, req) -> bytes:
+    """Читает тело ответа, но не дольше deadline.
+
+    Обычный таймаут requests сбрасывается от каждого байта, а OpenRouter, пока модель думает,
+    шлёт пробелы-keepalive, поэтому без общего дедлайна ответ можно ждать бесконечно.
+    """
+    chunks = []
+    try:
+        for chunk in resp.iter_content(chunk_size=None):  # куски по мере прихода, без ожидания 4 КБ
+            _check_cancel(req)
+            if chunk:
+                chunks.append(chunk)
+            if time.monotonic() > deadline:
+                raise ApiError("timeout", f"Модель не ответила за {MODEL_DEADLINE} с.")
+    except ApiError:
+        raise
+    except Exception:  # RequestException, а при отмене из другого потока — что угодно от закрытого сокета
+        _check_cancel(req)
+        raise ApiError("timeout", "Модель перестала отвечать (соединение оборвалось или зависло).")
+    finally:
+        resp.close()
+    _check_cancel(req)
+    return b"".join(chunks)
+
+
+def _ask_once(api_key: str, model: str, png_bytes: bytes, req=None) -> str:
+    _check_cancel(req)
+    deadline = time.monotonic() + MODEL_DEADLINE
     try:
         resp = requests.post(API_URL, json=build_payload(model, png_bytes), headers=_headers(api_key),
-                             timeout=TIMEOUT)
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True)
     except requests.Timeout:
-        raise ApiError("timeout", "Модель слишком долго думает (таймаут).")
+        _check_cancel(req)
+        raise ApiError("timeout", f"Модель не ответила за {MODEL_DEADLINE} с.")
     except requests.RequestException as e:
+        _check_cancel(req)
         raise ApiError("network", f"Нет соединения с OpenRouter: {e}")
+    if req is not None:
+        req.set(resp)
+    body = _read_body(resp, deadline, req)
+    body_text = body.decode("utf-8", errors="replace").strip()
 
     try:
-        data = resp.json()
+        data = json.loads(body_text)
     except ValueError:
         data = None
     if resp.status_code != 200:
         error = (data or {}).get("error") if isinstance(data, dict) else None
         if not isinstance(error, dict):
-            error = {"message": resp.text[:300]}
+            error = {"message": body_text[:300]}
         raise classify_error(resp.status_code, error, resp.headers)
     if not isinstance(data, dict):
         raise ApiError("server", "OpenRouter вернул непонятный ответ.")
@@ -176,7 +249,7 @@ def _ask_once(api_key: str, model: str, png_bytes: bytes) -> str:
     return content
 
 
-def ask_with_fallback(api_key: str, models: list, png_bytes: bytes, on_try=None):
+def ask_with_fallback(api_key: str, models: list, png_bytes: bytes, on_try=None, req=None):
     """Спрашивает первую модель, при временных сбоях — следующие. Возвращает (текст, модель)."""
     if not api_key:
         raise ApiError("auth", "Не указан API-ключ OpenRouter. Открой настройки ⚙ и вставь ключ.")
@@ -189,10 +262,11 @@ def ask_with_fallback(api_key: str, models: list, png_bytes: bytes, on_try=None)
 
     last_error = None
     for i, model in enumerate(candidates):
+        _check_cancel(req)
         if on_try and i > 0:
             on_try(model)
         try:
-            return _ask_once(api_key, model, png_bytes), model
+            return _ask_once(api_key, model, png_bytes, req), model
         except ApiError as e:
             last_error = e
             if e.kind not in _RETRYABLE:
@@ -277,17 +351,26 @@ class AskWorker(QThread):
     trying = Signal(str)
     finished_ok = Signal(str, str)  # текст, модель которая ответила
     failed = Signal(str)
+    cancelled = Signal()
 
     def __init__(self, api_key, models, png_bytes, parent=None):
         super().__init__(parent)
         self._args = (api_key, list(models), png_bytes)
+        self._req = _Request()
+
+    def cancel(self):
+        """Останавливает запрос: закрывает соединение и не пробует запасные модели."""
+        self._req.cancel()
 
     def run(self):
         api_key, models, png = self._args
         try:
-            text, model = ask_with_fallback(api_key, models, png, on_try=self.trying.emit)
+            text, model = ask_with_fallback(api_key, models, png, on_try=self.trying.emit, req=self._req)
             self.finished_ok.emit(text, model)
         except ApiError as e:
+            if e.kind == "cancelled" or self._req.cancel_event.is_set():
+                self.cancelled.emit()
+                return
             message = e.full_text()
             if e.kind == "daily_limit":
                 info = check_key(api_key)
@@ -295,7 +378,10 @@ class AskWorker(QThread):
                     message += f"\n\n{describe_key(info)}"
             self.failed.emit(message)
         except Exception as e:  # чтобы поток никогда не падал молча
-            self.failed.emit(f"Непредвиденная ошибка: {e}")
+            if self._req.cancel_event.is_set():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(f"Непредвиденная ошибка: {e}")
 
 
 class KeyWorker(QThread):
