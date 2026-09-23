@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 
 # Сервисы с API, совместимым с OpenAI. Ключи пользователь вводит в настройках, здесь их нет.
 PROVIDERS = {
@@ -15,6 +15,8 @@ PROVIDERS = {
         "models_url": "https://api.groq.com/openai/v1/models",
         "keys_page": "https://console.groq.com/keys",
         "key_placeholder": "gsk_…",
+        # Точный режим: qwen3.8 читает скриншот, а gpt-oss-120b (настоящие рассуждения) решает.
+        "reasoner": "openai/gpt-oss-120b",
         "default_models": [
             "qwen/qwen3.8-27b",
             "openai/gpt-oss-120b",
@@ -32,6 +34,19 @@ PROVIDERS = {
             "gemini-3.8-flash",
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
+        ],
+    },
+    "orcarouter": {
+        "name": "OrcaRouter",
+        "chat_url": "https://api.orcarouter.ai/v1/chat/completions",
+        "models_url": "https://api.orcarouter.ai/v1/models",
+        "keys_page": "https://www.orcarouter.ai/console",
+        "key_placeholder": "sk-orca-…",
+        "default_models": [
+            "deepseek/deepseek-v4-flash-free",
+            "z-ai/glm-5.3-flash-free",
+            "tencent/hy3-free",
+            "orcarouter/free",
         ],
     },
     "nvidia": {
@@ -79,34 +94,88 @@ PROVIDERS = {
 DEFAULT_PROVIDER = "groq"
 DEFAULT_MODELS = PROVIDERS["openrouter"]["default_models"]  # для совместимости
 
-_ANSWER_FORMAT = (
-    "Формат ответа:\n"
-    "1. Первой строкой — **Ответ:** и сам правильный ответ (для теста — номер/буква "
-    "и текст варианта; если верных вариантов несколько — перечисли все).\n"
-    "2. Затем коротко, в 1–4 строках, поясни почему.\n"
-    "Если заданий несколько — ответь на каждое по порядку. "
-    "Если задание не видно или его нельзя решить — так и скажи. "
-    "Всегда отвечай на русском языке, даже если задание на другом языке."
+# Правила, которые добавляются к любому промпту — и к встроенным, и к своим.
+COMMON_RULES = (
+    "Всегда отвечай на русском языке, даже если задание на другом языке.\n"
+    "Не используй LaTeX и знаки $: формулы пиши обычным текстом и символами Unicode, "
+    "например 17 × 3 + 9 = 60, x² − 4 = 0, √16 = 4, 1/2, 90°."
+)
+IMAGE_INTRO = "Ты — ZhukoGPT, помощник. Тебе присылают скриншот части экрана — внимательно прочитай всё, что на нём."
+TEXT_INTRO = (
+    "Ты — ZhukoGPT, помощник. Тебе дают текст, автоматически распознанный со скриншота (OCR): "
+    "в нём возможны опечатки, склеенные слова и перепутанный порядок строк, а картинки и графики "
+    "в него не попадают. Восстанови смысл. Если распознано несколько вариантов текста "
+    "(помечены языком, например [ru] и [en]), используй тот, что читается осмысленно."
 )
 
-SYSTEM_PROMPT = (
-    "Ты — ZhukoGPT, помощник, который решает задачи и тесты по скриншоту. "
-    "Внимательно прочитай всё, что изображено на картинке, и реши задание.\n" + _ANSWER_FORMAT
-)
+# Промпты по умолчанию. Пользователь может их менять, удалять и добавлять свои.
+DEFAULT_PROMPTS = [
+    {
+        "name": "Решить задание",
+        "text": (
+            "Реши задание.\n"
+            "Формат ответа:\n"
+            "1. Первой строкой — **Ответ:** и сам правильный ответ (для теста — номер/буква "
+            "и текст варианта; если верных вариантов несколько — перечисли все).\n"
+            "2. Затем коротко, в 1–4 строках, поясни почему.\n"
+            "Если заданий несколько — ответь на каждое по порядку. "
+            "Если задание не видно или его нельзя решить — так и скажи."
+        ),
+    },
+    {
+        "name": "Только ответ",
+        "text": ("Реши задание и напиши только ответ, без пояснений. "
+                 "Если заданий несколько — по одному ответу на строку, с номером задания."),
+    },
+    {
+        "name": "Подробно объяснить",
+        "text": ("Объясни решение подробно, как учитель ученику: по шагам, простыми словами, "
+                 "с промежуточными вычислениями. В конце отдельной строкой — **Ответ:**."),
+    },
+    {
+        "name": "Перевести",
+        "text": ("Переведи весь текст со скриншота на русский язык. Сохрани структуру: абзацы, "
+                 "списки, варианты ответов. Выведи только перевод — без решения, пояснений "
+                 "и вступительных фраз."),
+    },
+]
 
-SYSTEM_PROMPT_TEXT = (
-    "Ты — ZhukoGPT, помощник, который решает задачи и тесты. Тебе дают текст, автоматически "
-    "распознанный со скриншота (OCR): в нём возможны опечатки, склеенные слова и перепутанный "
-    "порядок строк, а картинки и графики в него не попадают. Восстанови смысл задания и реши его. "
-    "Если распознано несколько вариантов текста (помечены языком, например [ru] и [en]), "
-    "используй тот, что читается осмысленно.\n" + _ANSWER_FORMAT
-)
 
-USER_PROMPT = "Реши задание на скриншоте."
-USER_PROMPT_TEXT = "Реши задание. Текст с экрана (распознан автоматически, возможны ошибки):\n\n"
+def build_system_prompt(prompt_text: str, ocr: bool, transcript: bool = False) -> str:
+    """Системный промпт: вступление (скриншот, OCR-текст или переписанное задание) + задача + правила."""
+    intro = TRANSCRIPT_INTRO if transcript else (TEXT_INTRO if ocr else IMAGE_INTRO)
+    return f"{intro}\n\nЗадача:\n{prompt_text.strip()}\n\n{COMMON_RULES}"
+
+
+# Точный режим 🎯: модель дольше думает и перепроверяет себя.
+ACCURATE_ADDON = (
+    "Точный режим: решай очень внимательно. Про себя реши задание пошагово, затем проверь каждое "
+    "вычисление ещё раз (другим способом или подстановкой) и сверь итог с вариантами ответа. "
+    "Если нашлась ошибка — исправь. Черновик и проверку в ответ НЕ выписывай: выведи только "
+    "итог строго в формате задачи выше."
+)
+# Шаг 1 точного режима: модель со зрением только переписывает задание, ничего не решая.
+TRANSCRIBE_PROMPT = (
+    "Перепиши дословно всё задание со скриншота(ов): условие, все числа, единицы, формулы "
+    "(обычным текстом, например x² − 4 = 0), варианты ответов с их буквами/номерами. "
+    "Если есть рисунок, график, схема или таблица — опиши их словами со всеми числами и подписями. "
+    "Если скриншотов несколько — это одно задание, перепиши части по порядку. "
+    "Сохраняй язык оригинала. Ничего не решай и не добавляй от себя."
+)
+TRANSCRIPT_INTRO = (
+    "Ты — ZhukoGPT, помощник. Тебе дают задание, аккуратно переписанное со скриншота "
+    "(рисунки и графики описаны словами)."
+)
+MAX_BATCH_PARTS = 3  # сколько кусков длинного задания можно собрать в один запрос
+
+USER_PROMPT = "Вот скриншот. Выполни задачу."
+USER_PROMPT_TEXT = "Выполни задачу. Текст с экрана (распознан автоматически, возможны ошибки):\n\n"
+USER_PROMPT_TRANSCRIPT = "Выполни задачу. Задание со скриншота:\n\n"
 
 HOTKEY_ACTIONS = {
     "screenshot": "Скриншот области",
+    "screenshot_full": "Скриншот всего экрана",
+    "screenshot_add": "Добавить кусок задания",
     "toggle": "Показать / скрыть окно",
     "repeat": "Повторить последний запрос",
     "quit": "Выход из программы",
@@ -123,12 +192,20 @@ DEFAULTS = {
     "providers": {pid: _provider_defaults(pid) for pid in PROVIDERS},
     "hotkeys": {
         "screenshot": "Alt+Q",
+        "screenshot_full": "Alt+S",
+        "screenshot_add": "Alt+D",
         "toggle": "Alt+W",
         "repeat": "Alt+R",
         "quit": "Ctrl+Alt+Q",
     },
     "hide_from_capture": True,
     "geometry": None,  # [x, y, w, h]
+    "auto_update": True,
+    "fallback_services": True,  # при лимите/ошибке пробовать другие сервисы с ключами
+    "accurate": False,
+    "accurate_warned": False,
+    "prompts": copy.deepcopy(DEFAULT_PROMPTS),
+    "active_prompt": 0,
 }
 
 
@@ -178,10 +255,36 @@ def load() -> dict:
         cfg["provider"] = "openrouter"  # у 1.0.x был только OpenRouter — оставляем его
     if isinstance(saved.get("hotkeys"), dict):
         cfg["hotkeys"].update(saved["hotkeys"])
-    for key in ("hide_from_capture", "geometry"):
+    for key in ("hide_from_capture", "geometry", "auto_update", "fallback_services", "accurate",
+                "accurate_warned"):
         if key in saved:
             cfg[key] = saved[key]
+    prompts = saved.get("prompts")
+    if isinstance(prompts, list):
+        prompts = [{"name": str(p.get("name") or "Без названия"), "text": str(p.get("text") or "")}
+                   for p in prompts if isinstance(p, dict) and str(p.get("text") or "").strip()]
+        if prompts:
+            cfg["prompts"] = prompts
+    if isinstance(saved.get("active_prompt"), int):
+        cfg["active_prompt"] = saved["active_prompt"]
+    cfg["active_prompt"] = min(max(cfg["active_prompt"], 0), len(cfg["prompts"]) - 1)
     return cfg
+
+
+def services_order(cfg: dict) -> list:
+    """Выбранный сервис первым, затем остальные с ключами: [(provider, api_key, models), …]."""
+    def entry(pid):
+        p = cfg["providers"][pid]
+        return pid, p.get("api_key", ""), [p["model"]] + [m for m in p.get("models", []) if m != p["model"]]
+    order = [entry(cfg["provider"])]
+    if cfg.get("fallback_services", True):
+        order += [entry(pid) for pid in PROVIDERS if pid != cfg["provider"] and cfg["providers"][pid].get("api_key")]
+    return order
+
+
+def active_prompt(cfg: dict) -> dict:
+    """Выбранный промпт: {'name', 'text'}."""
+    return cfg["prompts"][cfg["active_prompt"]]
 
 
 def save(cfg: dict) -> None:
