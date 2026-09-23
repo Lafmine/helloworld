@@ -12,7 +12,7 @@
 
 ## ⬇ Скачать
 
-**[Скачать ZhukoGPT.exe](https://github.com/lafmine/helloworld/releases/latest)** из раздела Releases. Python для него не нужен.
+**[Скачать ZhukoGPT.exe](https://github.com/bobopsya/zhukoGPT/releases/latest)** из раздела Releases. Python для него не нужен.
 
 ### Первый запуск: Groq (бесплатно, быстро)
 

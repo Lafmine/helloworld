@@ -77,7 +77,7 @@ def _headers(provider, api_key):
     headers = {"Authorization": f"Bearer {api_key}"}
     if provider == "openrouter":
         headers["X-Title"] = APP_NAME
-        headers["HTTP-Referer"] = "https://github.com/lafmine/helloworld"
+        headers["HTTP-Referer"] = "https://github.com/bobopsya/zhukoGPT"
     return headers
 
 
