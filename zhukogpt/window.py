@@ -189,6 +189,7 @@ class MainWindow(QWidget):
         self._busy_model = model.split("/")[-1] + (f" ({note})" if note else "")
         self._dots = 0
         self._busy_since = time.monotonic()
+        self._busy_status = None
         self._set_busy_buttons(True)
         self._busy_timer.start()
         self._tick_busy()
@@ -203,7 +204,13 @@ class MainWindow(QWidget):
         self._dots = (self._dots + 1) % 4
         seconds = int(time.monotonic() - self._busy_since)
         self.view.setMarkdown(f"### 🪲 Думаю{'.' * self._dots}  {seconds} с")
-        self.set_status(f"Модель: {self._busy_model}")
+        self.set_status(self._busy_status or f"Модель: {self._busy_model}")
+
+    def set_busy_status(self, text):
+        """Текст в строке состояния, пока идёт запрос (например, «Распознаю текст…»)."""
+        self._busy_status = text
+        if self._busy_timer.isActive():
+            self.set_status(text)
 
     def show_answer(self, text):
         self._busy_timer.stop()

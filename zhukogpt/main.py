@@ -41,8 +41,8 @@ class ZhukoApp:
         self.window.show()
         self._register_hotkeys()
         self._show_welcome()
-        if not self.cfg.get("api_key"):
-            # Первый запуск: без ключа OpenRouter работать нельзя — сразу открываем настройки.
+        if not config.active(self.cfg).get("api_key"):
+            # Первый запуск: без ключа сервиса работать нельзя — сразу открываем настройки.
             QTimer.singleShot(300, self.open_settings)
 
     # --- хоткеи ---
@@ -65,9 +65,13 @@ class ZhukoApp:
     def _show_welcome(self):
         hk = self.cfg["hotkeys"]
         lines = ["### Привет! Я ZhukoGPT 🪲", ""]
-        if not self.cfg.get("api_key"):
-            lines += ["**Сначала вставь API-ключ OpenRouter** в настройках ⚙ "
-                      "(бесплатно: [openrouter.ai/keys](https://openrouter.ai/keys)).", ""]
+        info = config.PROVIDERS[self.cfg["provider"]]
+        current = config.active(self.cfg)
+        if not current.get("api_key"):
+            lines += [f"**Сначала вставь API-ключ {info['name']}** в настройках ⚙ "
+                      f"([{info['keys_page'].split('://', 1)[-1]}]({info['keys_page']})).", ""]
+        else:
+            lines += [f"Сервис: **{info['name']}**, модель: `{current['model']}`", ""]
         lines += [
             f"- **{hk.get('screenshot', '—')}** — выделить область и решить задание",
             f"- **{hk.get('toggle', '—')}** — показать / скрыть окно",
@@ -87,9 +91,9 @@ class ZhukoApp:
     def take_screenshot(self):
         if self.selector is not None:
             return
-        if not self.cfg.get("api_key"):
+        if not config.active(self.cfg).get("api_key"):
             self._restore_window()
-            self.window.show_error("Сначала вставь API-ключ OpenRouter в настройках ⚙.")
+            self.window.show_error(f"Сначала вставь API-ключ {self._provider_name()} в настройках ⚙.")
             self.open_settings()
             return
         # Если окно не скрыто от захвата — прячем его на время снимка.
@@ -142,12 +146,14 @@ class ZhukoApp:
             self.window.set_status("Ещё думаю над прошлым скриншотом — подожди или нажми «Стоп»")
             return
         self.last_png = png
-        model = self.cfg["model"]
+        current = config.active(self.cfg)
+        model = current["model"]
         # Выбранная модель первой, остальные из списка — запасные при перегрузке провайдера.
-        models = [model] + [m for m in self.cfg.get("models", []) if m != model]
+        models = [model] + [m for m in current.get("models", []) if m != model]
         self.window.set_busy(model)
-        self.worker = AskWorker(self.cfg.get("api_key", ""), models, png)
+        self.worker = AskWorker(self.cfg["provider"], current.get("api_key", ""), models, png)
         self.worker.trying.connect(self._on_trying)
+        self.worker.status.connect(self.window.set_busy_status)
         self.worker.finished_ok.connect(self._on_answer)
         self.worker.failed.connect(self._on_error)
         self.worker.cancelled.connect(self._on_cancelled_request)
@@ -159,7 +165,7 @@ class ZhukoApp:
             return
         # Отвязываем поток сразу: окно освобождается мгновенно, а соединение закрывается в фоне.
         worker.cancel()
-        for sig in (worker.trying, worker.finished_ok, worker.failed, worker.cancelled):
+        for sig in (worker.trying, worker.status, worker.finished_ok, worker.failed, worker.cancelled):
             sig.disconnect()
         self._old_workers.append(worker)
         worker.finished.connect(lambda w=worker: self._old_workers.remove(w))
@@ -170,6 +176,9 @@ class ZhukoApp:
         self.window.show_message("Запрос остановлен. Можно сделать новый скриншот или нажать "
                                  f"**{self.cfg['hotkeys'].get('repeat', '')}**, чтобы повторить.")
         self.window.set_status(self._ready_text())
+
+    def _provider_name(self):
+        return config.PROVIDERS[self.cfg["provider"]]["name"]
 
     def _on_trying(self, model):
         self.window.set_busy(model, note="прошлая модель занята, пробую другую")

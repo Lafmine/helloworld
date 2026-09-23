@@ -1,4 +1,4 @@
-"""Работа с OpenRouter."""
+"""Запросы к ИИ-сервисам (OpenRouter, TeamoRouter) — оба совместимы с API OpenAI."""
 import base64
 import json
 import threading
@@ -9,11 +9,12 @@ import requests
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QThread, Qt, Signal
 from PySide6.QtGui import QImage
 
-from .config import APP_NAME, SYSTEM_PROMPT, USER_PROMPT
+from . import ocr
+from .config import (APP_NAME, PROVIDERS, SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT, USER_PROMPT,
+                     USER_PROMPT_TEXT)
 
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODELS_URL = "https://openrouter.ai/api/v1/models"
-KEY_URL = "https://openrouter.ai/api/v1/key"
+OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+TEAMO_PROBE_MODEL = "deepseek-v4-flash-free"
 CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 20  # сколько сервер может молчать совсем без байтов
 MODEL_DEADLINE = 45  # секунд на одну модель, потом — следующая
@@ -26,7 +27,7 @@ _RETRYABLE = {"upstream", "unavailable", "server", "timeout", "empty"}
 
 
 class ApiError(RuntimeError):
-    """Ошибка OpenRouter: kind — тип, detail — оригинальный текст от сервера."""
+    """Ошибка сервиса: kind — тип, detail — оригинальный текст от сервера."""
 
     def __init__(self, kind, message, detail="", status=None, reset_ms=None):
         super().__init__(message)
@@ -34,28 +35,46 @@ class ApiError(RuntimeError):
         self.detail = detail
         self.status = status
         self.reset_ms = reset_ms
+        self.source = "сервиса"
 
     def full_text(self):
         text = str(self)
         if self.detail:
             safe = "".join("\\" + ch if ch in "*_`[]<>#" else ch for ch in self.detail)
-            text += f"\n\n*Подробности от OpenRouter: {safe}*"
+            text += f"\n\n*Подробности от {self.source}: {safe}*"
         return text
 
 
-def _headers(api_key):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "X-Title": APP_NAME,
-        "HTTP-Referer": "https://github.com/lafmine/helloworld",
-    }
+def provider_name(provider: str) -> str:
+    return PROVIDERS[provider]["name"]
 
 
-def build_payload(model: str, png_bytes: bytes) -> dict:
-    image_b64 = base64.b64encode(png_bytes).decode("ascii")
-    return {
-        "model": model,
-        "messages": [
+def has_vision(provider: str, model: str) -> bool:
+    """Видит ли модель картинки. Иначе ей отправляется текст, распознанный OCR."""
+    if provider == "openrouter":
+        return True  # в списке OpenRouter только модели с картинками
+    name = model.lower()
+    return "vision" in name or "-vl" in name or name.endswith("vl")
+
+
+def _headers(provider, api_key):
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if provider == "openrouter":
+        headers["X-Title"] = APP_NAME
+        headers["HTTP-Referer"] = "https://github.com/lafmine/helloworld"
+    return headers
+
+
+def build_payload(provider: str, model: str, png_bytes: bytes = None, text: str = None) -> dict:
+    """Запрос с картинкой или, для моделей без зрения, с распознанным текстом."""
+    if text is not None:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_TEXT},
+            {"role": "user", "content": USER_PROMPT_TEXT + text},
+        ]
+    else:
+        image_b64 = base64.b64encode(png_bytes).decode("ascii")
+        messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
@@ -64,10 +83,12 @@ def build_payload(model: str, png_bytes: bytes) -> dict:
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
                 ],
             },
-        ],
+        ]
+    payload = {"model": model, "messages": messages}
+    if provider == "openrouter":
         # «Думающие» модели рассуждают короче, а текст рассуждений не попадает в ответ.
-        "reasoning": {"effort": "low", "exclude": True},
-    }
+        payload["reasoning"] = {"effort": "low", "exclude": True}
+    return payload
 
 
 def downscale_png(png_bytes: bytes, max_side: int = MAX_IMAGE_SIDE) -> bytes:
@@ -104,29 +125,39 @@ def _error_detail(error: dict) -> str:
     return " • ".join(parts)
 
 
-def classify_error(status, error: dict, headers=None) -> ApiError:
-    """Превращает ошибку OpenRouter в ApiError с понятным русским текстом."""
+def _is_balance_error(error: dict, text: str) -> bool:
+    markers = f"{error.get('type', '')} {error.get('code', '')}".lower()
+    return "insufficient_balance" in markers or "balance is insufficient" in text
+
+
+def classify_error(status, error: dict, headers=None, provider="openrouter") -> ApiError:
+    """Превращает ошибку сервиса в ApiError с понятным русским текстом."""
     headers = headers or {}
+    name = provider_name(provider)
     detail = _error_detail(error)
     text = detail.lower()
     meta = error.get("metadata") or {}
     reset_ms = headers.get("X-RateLimit-Reset")
 
+    if _is_balance_error(error, text):
+        return ApiError("balance", f"На балансе {name} нет денег. Даже бесплатные (free) модели там работают "
+                        f"только при ненулевом балансе. Пополнить: {PROVIDERS[provider]['keys_page']}",
+                        detail, status)
     if status == 401:
-        return ApiError("auth", "Неверный API-ключ OpenRouter. Проверь его в настройках ⚙ (кнопка «Проверить ключ»).",
+        return ApiError("auth", f"Неверный API-ключ {name}. Проверь его в настройках ⚙ (кнопка «Проверить»).",
                         detail, status)
     if status == 402:
-        return ApiError("credits", "OpenRouter просит пополнить баланс. Для бесплатных моделей это значит, что "
+        return ApiError("credits", f"{name} просит пополнить баланс. Для бесплатных моделей это значит, что "
                         "ключ создан с лимитом 0 или модель стала платной. Выбери другую модель или проверь ключ.",
                         detail, status)
     if status == 403:
-        return ApiError("other", "OpenRouter отклонил запрос (модерация или ограничения ключа).", detail, status)
-    if status == 404:
+        return ApiError("other", f"{name} отклонил запрос (модерация или ограничения ключа).", detail, status)
+    if status == 404 or "does not support image" in text:
         return ApiError("unavailable", "Модель сейчас недоступна.", detail, status)
     if status == 408:
         return ApiError("timeout", "Модель не успела ответить.", detail, status)
     if status == 429:
-        if "per-day" in text or "per day" in text or "daily" in text or "free-models-per-day" in text:
+        if provider == "openrouter" and ("per-day" in text or "per day" in text or "daily" in text):
             reset = _format_reset(reset_ms)
             when = f" Лимит обновится в {reset}." if reset else " Лимит обновляется раз в сутки (в 03:00 по МСК)."
             return ApiError("daily_limit", "Закончились бесплатные запросы на сегодня для твоего аккаунта OpenRouter "
@@ -134,13 +165,13 @@ def classify_error(status, error: dict, headers=None) -> ApiError:
                             " Если один раз пополнить OpenRouter на $10, лимит станет 1000 запросов в день.",
                             detail, status, reset_ms)
         if "upstream" in text or meta.get("provider_name"):
-            return ApiError("upstream", "Провайдер этой бесплатной модели сейчас перегружен (это общий лимит "
-                            "для всех пользователей OpenRouter, а не твой).", detail, status)
-        return ApiError("minute_limit", "Слишком много запросов за минуту (лимит 20 в минуту). Подожди минуту.",
+            return ApiError("upstream", f"Провайдер этой модели сейчас перегружен (это общий лимит "
+                            f"для всех пользователей {name}, а не твой).", detail, status)
+        return ApiError("minute_limit", "Слишком много запросов подряд. Подожди минуту.",
                         detail, status, reset_ms)
     if status is not None and status >= 500:
         return ApiError("server", "Сбой на стороне провайдера модели.", detail, status)
-    return ApiError("other", f"Ошибка OpenRouter ({status}).", detail, status)
+    return ApiError("other", f"Ошибка {name} ({status}).", detail, status)
 
 
 class _Request:
@@ -201,18 +232,18 @@ def _read_body(resp, deadline, req) -> bytes:
     return b"".join(chunks)
 
 
-def _ask_once(api_key: str, model: str, png_bytes: bytes, req=None) -> str:
+def _ask_once(provider: str, api_key: str, payload: dict, req=None) -> str:
     _check_cancel(req)
     deadline = time.monotonic() + MODEL_DEADLINE
     try:
-        resp = requests.post(API_URL, json=build_payload(model, png_bytes), headers=_headers(api_key),
+        resp = requests.post(PROVIDERS[provider]["chat_url"], json=payload, headers=_headers(provider, api_key),
                              timeout=(CONNECT_TIMEOUT, READ_TIMEOUT), stream=True)
     except requests.Timeout:
         _check_cancel(req)
         raise ApiError("timeout", f"Модель не ответила за {MODEL_DEADLINE} с.")
     except requests.RequestException as e:
         _check_cancel(req)
-        raise ApiError("network", f"Нет соединения с OpenRouter: {e}")
+        raise ApiError("network", f"Нет соединения с {provider_name(provider)}: {e}")
     if req is not None:
         req.set(resp)
     body = _read_body(resp, deadline, req)
@@ -226,18 +257,18 @@ def _ask_once(api_key: str, model: str, png_bytes: bytes, req=None) -> str:
         error = (data or {}).get("error") if isinstance(data, dict) else None
         if not isinstance(error, dict):
             error = {"message": body_text[:300]}
-        raise classify_error(resp.status_code, error, resp.headers)
+        raise classify_error(resp.status_code, error, resp.headers, provider)
     if not isinstance(data, dict):
-        raise ApiError("server", "OpenRouter вернул непонятный ответ.")
-    # OpenRouter иногда отдаёт 200, но с ошибкой провайдера внутри.
+        raise ApiError("server", f"{provider_name(provider)} вернул непонятный ответ.")
+    # Сервис иногда отдаёт 200, но с ошибкой провайдера внутри.
     if isinstance(data.get("error"), dict):
         err = data["error"]
         code = err.get("code")
-        raise classify_error(code if isinstance(code, int) else 502, err, resp.headers)
+        raise classify_error(code if isinstance(code, int) else 502, err, resp.headers, provider)
     try:
         choice = data["choices"][0]
         if isinstance(choice.get("error"), dict):
-            raise classify_error(502, choice["error"], resp.headers)
+            raise classify_error(502, choice["error"], resp.headers, provider)
         content = choice["message"]["content"]
     except (KeyError, IndexError, TypeError, AttributeError):
         raise ApiError("empty", "Модель вернула пустой ответ.")
@@ -249,45 +280,70 @@ def _ask_once(api_key: str, model: str, png_bytes: bytes, req=None) -> str:
     return content
 
 
-def ask_with_fallback(api_key: str, models: list, png_bytes: bytes, on_try=None, req=None):
+def _recognize_text(png_bytes: bytes) -> str:
+    try:
+        text = ocr.recognize(png_bytes)
+    except ocr.OcrUnavailable as e:
+        raise ApiError("ocr", f"Эта модель не видит картинки, а распознать текст не получилось: {e}")
+    if not text.strip():
+        raise ApiError("ocr_empty", "На выделенной области не найден текст. Выдели задание крупнее "
+                       "или выбери модель, которая видит картинки (👁 в настройках).")
+    return text
+
+
+def ask_with_fallback(provider: str, api_key: str, models: list, png_bytes: bytes,
+                      on_try=None, on_status=None, req=None):
     """Спрашивает первую модель, при временных сбоях — следующие. Возвращает (текст, модель)."""
+    name = provider_name(provider)
     if not api_key:
-        raise ApiError("auth", "Не указан API-ключ OpenRouter. Открой настройки ⚙ и вставь ключ.")
+        raise ApiError("auth", f"Не указан API-ключ {name}. Открой настройки ⚙ и вставь ключ.")
     candidates = []
     for m in models:
         if m and m not in candidates:
             candidates.append(m)
     candidates = candidates[:1 + MAX_FALLBACKS]
-    png_bytes = downscale_png(png_bytes)
 
+    small_png = None
+    ocr_text = None  # распознаём один раз и только если понадобится
     last_error = None
     for i, model in enumerate(candidates):
         _check_cancel(req)
         if on_try and i > 0:
             on_try(model)
         try:
-            return _ask_once(api_key, model, png_bytes, req), model
+            if has_vision(provider, model):
+                if small_png is None:
+                    small_png = downscale_png(png_bytes)
+                payload = build_payload(provider, model, png_bytes=small_png)
+            else:
+                if ocr_text is None:
+                    if on_status:
+                        on_status("Распознаю текст на скриншоте…")
+                    ocr_text = _recognize_text(png_bytes)  # оригинал: в высоком разрешении читается лучше
+                    _check_cancel(req)
+                    if on_status:
+                        on_status(f"Модель: {model} (по распознанному тексту)")
+                payload = build_payload(provider, model, text=ocr_text)
+            return _ask_once(provider, api_key, payload, req), model
         except ApiError as e:
+            e.source = name
             last_error = e
             if e.kind not in _RETRYABLE:
-                break  # лимит аккаунта / ключ: другие модели не помогут
+                break  # лимит аккаунта / баланс / ключ: другие модели не помогут
     if last_error.kind in _RETRYABLE and len(candidates) > 1:
         last_error.args = (f"{last_error} Пробовал модели: "
                            + ", ".join(m.split('/')[-1] for m in candidates) + ". Попробуй чуть позже.",)
     raise last_error
 
 
-def ask(api_key: str, model: str, png_bytes: bytes) -> str:
-    """Один запрос к одной модели (без запасных)."""
-    return ask_with_fallback(api_key, [model], png_bytes)[0]
-
-
-def check_key(api_key: str) -> dict:
-    """Проверка ключа: {'valid', 'is_free_tier', 'used', 'limit', 'remaining'}."""
+def check_key(provider: str, api_key: str) -> dict:
+    """Проверка ключа выбранного сервиса."""
     if not api_key:
         return {"valid": False, "error": "Ключ не указан"}
+    if provider == "teamorouter":
+        return _check_teamo_key(api_key)
     try:
-        resp = requests.get(KEY_URL, headers=_headers(api_key), timeout=20)
+        resp = requests.get(OPENROUTER_KEY_URL, headers=_headers(provider, api_key), timeout=20)
     except requests.RequestException as e:
         return {"valid": None, "error": f"Нет соединения: {e}"}
     if resp.status_code == 401:
@@ -313,12 +369,38 @@ def check_key(api_key: str) -> dict:
     }
 
 
+def _check_teamo_key(api_key: str) -> dict:
+    headers = _headers("teamorouter", api_key)
+    try:
+        resp = requests.get(PROVIDERS["teamorouter"]["models_url"], headers=headers, timeout=20)
+    except requests.RequestException as e:
+        return {"valid": None, "error": f"Нет соединения: {e}"}
+    if resp.status_code == 401:
+        return {"valid": False, "error": "Неверный ключ"}
+    if resp.status_code != 200:
+        return {"valid": None, "error": f"TeamoRouter ответил {resp.status_code}"}
+    # Пробный крошечный запрос к бесплатной модели: так видно, пускает ли сервис без баланса.
+    try:
+        probe = requests.post(PROVIDERS["teamorouter"]["chat_url"], headers=headers, timeout=30, json={
+            "model": TEAMO_PROBE_MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "1"}]})
+        error = probe.json().get("error") if probe.status_code != 200 else None
+    except (requests.RequestException, ValueError):
+        return {"valid": True}
+    if isinstance(error, dict) and _is_balance_error(error, str(error.get("message", "")).lower()):
+        return {"valid": True, "balance_needed": True}
+    return {"valid": True, "free_ok": probe.status_code == 200}
+
+
 def describe_key(info: dict) -> str:
     if info.get("valid") is False:
         return f"✗ {info.get('error', 'Неверный ключ')}"
     if info.get("valid") is None:
         return f"? Не удалось проверить: {info.get('error', '')}"
     parts = ["✓ Ключ работает"]
+    if info.get("balance_needed"):
+        parts.append("⚠ на балансе 0 — даже free-модели не ответят, пока баланс не пополнен")
+    elif info.get("free_ok"):
+        parts.append("бесплатные модели отвечают")
     used, limit, remaining = info.get("used"), info.get("limit"), info.get("remaining")
     if remaining is None and used is not None and limit is not None:
         remaining = max(0, limit - used)
@@ -331,31 +413,40 @@ def describe_key(info: dict) -> str:
     return " • ".join(parts)
 
 
-def fetch_free_vision_models() -> list:
-    """Список бесплатных моделей OpenRouter, которые понимают картинки."""
-    resp = requests.get(MODELS_URL, timeout=30)
+def fetch_models(provider: str, api_key: str = "") -> list:
+    """Актуальный список подходящих моделей: бесплатные (и со зрением у TeamoRouter)."""
+    info = PROVIDERS[provider]
+    headers = _headers(provider, api_key) if api_key else {}
+    resp = requests.get(info["models_url"], headers=headers, timeout=30)
+    if resp.status_code == 401:
+        raise RuntimeError("нужен рабочий API-ключ")
     resp.raise_for_status()
     result = []
     for m in resp.json().get("data", []):
         model_id = m.get("id", "")
-        modalities = (m.get("architecture") or {}).get("input_modalities") or []
-        if not model_id.endswith(":free") or "image" not in modalities:
-            continue
         if any(word in model_id.lower() for word in _EXCLUDE_WORDS):
             continue
-        result.append(model_id)
-    return sorted(result)
+        if provider == "openrouter":
+            modalities = (m.get("architecture") or {}).get("input_modalities") or []
+            if model_id.endswith(":free") and "image" in modalities:
+                result.append(model_id)
+        elif model_id.endswith("-free") or has_vision(provider, model_id):
+            result.append(model_id)
+    if provider == "openrouter":
+        return sorted(result)
+    return sorted(result, key=lambda mid: (not mid.endswith("-free"), mid))  # бесплатные сверху
 
 
 class AskWorker(QThread):
     trying = Signal(str)
+    status = Signal(str)
     finished_ok = Signal(str, str)  # текст, модель которая ответила
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, api_key, models, png_bytes, parent=None):
+    def __init__(self, provider, api_key, models, png_bytes, parent=None):
         super().__init__(parent)
-        self._args = (api_key, list(models), png_bytes)
+        self._args = (provider, api_key, list(models), png_bytes)
         self._req = _Request()
 
     def cancel(self):
@@ -363,9 +454,10 @@ class AskWorker(QThread):
         self._req.cancel()
 
     def run(self):
-        api_key, models, png = self._args
+        provider, api_key, models, png = self._args
         try:
-            text, model = ask_with_fallback(api_key, models, png, on_try=self.trying.emit, req=self._req)
+            text, model = ask_with_fallback(provider, api_key, models, png, on_try=self.trying.emit,
+                                            on_status=self.status.emit, req=self._req)
             self.finished_ok.emit(text, model)
         except ApiError as e:
             if e.kind == "cancelled" or self._req.cancel_event.is_set():
@@ -373,7 +465,7 @@ class AskWorker(QThread):
                 return
             message = e.full_text()
             if e.kind == "daily_limit":
-                info = check_key(api_key)
+                info = check_key(provider, api_key)
                 if info.get("valid"):
                     message += f"\n\n{describe_key(info)}"
             self.failed.emit(message)
@@ -387,13 +479,13 @@ class AskWorker(QThread):
 class KeyWorker(QThread):
     finished_ok = Signal(dict)
 
-    def __init__(self, api_key, parent=None):
+    def __init__(self, provider, api_key, parent=None):
         super().__init__(parent)
-        self._api_key = api_key
+        self._args = (provider, api_key)
 
     def run(self):
         try:
-            self.finished_ok.emit(check_key(self._api_key))
+            self.finished_ok.emit(check_key(*self._args))
         except Exception as e:
             self.finished_ok.emit({"valid": None, "error": str(e)})
 
@@ -402,8 +494,12 @@ class ModelsWorker(QThread):
     finished_ok = Signal(list)
     failed = Signal(str)
 
+    def __init__(self, provider, api_key="", parent=None):
+        super().__init__(parent)
+        self._args = (provider, api_key)
+
     def run(self):
         try:
-            self.finished_ok.emit(fetch_free_vision_models())
+            self.finished_ok.emit(fetch_models(*self._args))
         except Exception as e:
             self.failed.emit(str(e))

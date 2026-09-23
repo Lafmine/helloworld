@@ -1,4 +1,5 @@
 """Окно настроек в том же «стеклянном» стиле."""
+import copy
 import html
 
 from PySide6.QtCore import QRectF, Qt
@@ -9,8 +10,8 @@ from PySide6.QtWidgets import (
 )
 
 from . import winapi
-from .api import KeyWorker, ModelsWorker, describe_key
-from .config import HOTKEY_ACTIONS, VERSION
+from .api import KeyWorker, ModelsWorker, describe_key, has_vision
+from .config import HOTKEY_ACTIONS, PROVIDERS, VERSION
 from .hotkeys import parse_hotkey
 from .window import BORDER_COLOR, RADIUS
 
@@ -40,8 +41,11 @@ QCheckBox::indicator { width: 16px; height: 16px; }
 """
 
 
-KEY_HINT = ('Бесплатный ключ: <a style="color:#8fd8ff" href="https://openrouter.ai/keys">'
-            'openrouter.ai/keys</a>')
+def key_hint(provider):
+    info = PROVIDERS[provider]
+    url = info["keys_page"]
+    label = url.split("://", 1)[-1]
+    return f'Ключ {info["name"]}: <a style="color:#8fd8ff" href="{url}">{html.escape(label)}</a>'
 
 
 class SettingsDialog(QDialog):
@@ -50,8 +54,11 @@ class SettingsDialog(QDialog):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Настройки ZhukoGPT")
         self.setStyleSheet(DIALOG_STYLE)
-        self.setMinimumWidth(580)
+        self.setMinimumWidth(600)
         self._cfg = cfg
+        # Черновики ключа и моделей каждого сервиса, пока диалог открыт.
+        self._drafts = copy.deepcopy(cfg["providers"])
+        self._provider = cfg["provider"]
         self._drag_offset = None
         self._models_worker = None
         self._key_worker = None
@@ -68,25 +75,31 @@ class SettingsDialog(QDialog):
         form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
+        # Сервис
+        self.provider_combo = QComboBox()
+        for pid, info in PROVIDERS.items():
+            self.provider_combo.addItem(info["name"], pid)
+        form.addRow("Сервис:", self.provider_combo)
+
         # API-ключ
         key_row = QHBoxLayout()
         key_row.setSpacing(8)
-        self.key_edit = QLineEdit(cfg.get("api_key", ""))
+        self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.Password)
-        self.key_edit.setPlaceholderText("sk-or-v1-…")
         btn_eye = QPushButton("👁")
         btn_eye.setCheckable(True)
         btn_eye.setFixedWidth(38)
         btn_eye.toggled.connect(
             lambda on: self.key_edit.setEchoMode(QLineEdit.Normal if on else QLineEdit.Password))
         self.btn_check = QPushButton("Проверить")
-        self.btn_check.setToolTip("Проверить ключ и остаток бесплатных запросов на сегодня")
+        self.btn_check.setToolTip("Проверить ключ (и остаток бесплатных запросов / баланс)")
         self.btn_check.clicked.connect(self._check_key)
         key_row.addWidget(self.key_edit, 1)
         key_row.addWidget(btn_eye)
         key_row.addWidget(self.btn_check)
-        form.addRow("API-ключ OpenRouter:", key_row)
-        self.key_hint = QLabel(KEY_HINT, objectName="hint")
+        self.key_label = QLabel()
+        form.addRow(self.key_label, key_row)
+        self.key_hint = QLabel(objectName="hint")
         self.key_hint.setOpenExternalLinks(True)
         self.key_hint.setWordWrap(True)
         form.addRow("", self.key_hint)
@@ -97,14 +110,14 @@ class SettingsDialog(QDialog):
         self.model_combo = QComboBox()
         self.model_combo.setMinimumContentsLength(22)
         self.model_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        self._fill_models(cfg.get("models", []), cfg.get("model", ""))
+        self.model_combo.currentTextChanged.connect(self._update_model_hint)
         self.btn_refresh = QPushButton("Обновить")
-        self.btn_refresh.setToolTip("Загрузить актуальный список бесплатных моделей с поддержкой картинок")
+        self.btn_refresh.setToolTip("Загрузить актуальный список бесплатных моделей")
         self.btn_refresh.clicked.connect(self._refresh_models)
         model_row.addWidget(self.model_combo, 1)
         model_row.addWidget(self.btn_refresh)
         form.addRow("Модель:", model_row)
-        self.models_hint = QLabel("Только бесплатные модели, которые понимают картинки", objectName="hint")
+        self.models_hint = QLabel(objectName="hint")
         self.models_hint.setWordWrap(True)
         form.addRow("", self.models_hint)
 
@@ -140,20 +153,58 @@ class SettingsDialog(QDialog):
         buttons.addWidget(btn_save)
         root.addLayout(buttons)
 
+        self.provider_combo.setCurrentIndex(self.provider_combo.findData(self._provider))
+        self._load_provider(self._provider)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+
+    # --- сервисы ---
+    def _stash(self):
+        """Запоминает то, что введено для текущего сервиса, перед переключением или сохранением."""
+        draft = self._drafts[self._provider]
+        draft["api_key"] = self.key_edit.text().strip()
+        draft["model"] = self.model_combo.currentText()
+        draft["models"] = [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
+
+    def _load_provider(self, provider):
+        info = PROVIDERS[provider]
+        draft = self._drafts[provider]
+        self.key_label.setText(f"API-ключ {info['name']}:")
+        self.key_edit.setText(draft.get("api_key", ""))
+        self.key_edit.setPlaceholderText(info["key_placeholder"])
+        self.key_hint.setText(key_hint(provider))
+        self._fill_models(draft.get("models") or info["default_models"], draft.get("model", ""))
+        self._update_model_hint()
         if not self.key_edit.text():
             self.key_edit.setFocus()
+
+    def _provider_changed(self, _index):
+        self._stash()
+        self._provider = self.provider_combo.currentData()
+        self._load_provider(self._provider)
+
+    def _update_model_hint(self, *_):
+        model = self.model_combo.currentText()
+        if not model:
+            self.models_hint.setText("")
+        elif has_vision(self._provider, model):
+            self.models_hint.setText("👁 Модель видит картинку — скриншот отправляется как есть")
+        else:
+            self.models_hint.setText("🔤 Модель не видит картинки — текст со скриншота распознаёт Windows "
+                                     "и отправляет его. Картинки и графики модель не увидит.")
 
     # --- проверка ключа ---
     def _check_key(self):
         self.btn_check.setEnabled(False)
         self.key_hint.setText("Проверяю ключ…")
-        self._key_worker = KeyWorker(self.key_edit.text().strip(), self)
+        self._key_worker = KeyWorker(self._provider, self.key_edit.text().strip(), self)
         self._key_worker.finished_ok.connect(self._key_checked)
         self._key_worker.start()
 
     def _key_checked(self, info):
         self.btn_check.setEnabled(True)
         color = {True: "#9df0b0", False: "#ffb4b4"}.get(info.get("valid"), "#ffe08a")
+        if info.get("balance_needed"):
+            color = "#ffe08a"
         self.key_hint.setText(f'<span style="color:{color}">{html.escape(describe_key(info))}</span>')
 
     # --- модели ---
@@ -169,21 +220,25 @@ class SettingsDialog(QDialog):
     def _refresh_models(self):
         self.btn_refresh.setEnabled(False)
         self.models_hint.setText("Загружаю список моделей…")
-        self._models_worker = ModelsWorker(self)
-        self._models_worker.finished_ok.connect(self._models_loaded)
+        provider = self._provider
+        self._models_worker = ModelsWorker(provider, self.key_edit.text().strip(), self)
+        self._models_worker.finished_ok.connect(lambda models: self._models_loaded(provider, models))
         self._models_worker.failed.connect(self._models_failed)
         self._models_worker.start()
 
-    def _models_loaded(self, models):
+    def _models_loaded(self, provider, models):
         self.btn_refresh.setEnabled(True)
         if not models:
-            self.models_hint.setText("Бесплатных моделей с картинками сейчас не нашлось — оставил старый список")
+            self._update_model_hint()
+            self.models_hint.setText("Подходящих моделей сейчас не нашлось — оставил старый список")
+            return
+        if provider != self._provider:  # пока грузилось, переключили сервис
+            self._drafts[provider]["models"] = models
             return
         current = self.model_combo.currentText()
-        self.model_combo.clear()
-        self.model_combo.addItems(models)
-        self.model_combo.setCurrentText(current if current in models else models[0])
-        self.models_hint.setText(f"Загружено моделей: {len(models)}")
+        self._fill_models(models, current if current in models else models[0])
+        self._update_model_hint()
+        self.models_hint.setText(f"Загружено моделей: {len(models)}. " + self.models_hint.text())
 
     def _models_failed(self, err):
         self.btn_refresh.setEnabled(True)
@@ -206,9 +261,9 @@ class SettingsDialog(QDialog):
         if not hotkeys.get("screenshot"):
             return self._show_error("Бинд для скриншота обязателен.")
 
-        self._cfg["api_key"] = self.key_edit.text().strip()
-        self._cfg["model"] = self.model_combo.currentText()
-        self._cfg["models"] = [self.model_combo.itemText(i) for i in range(self.model_combo.count())]
+        self._stash()
+        self._cfg["provider"] = self._provider
+        self._cfg["providers"] = self._drafts
         self._cfg["hotkeys"] = hotkeys
         self._cfg["hide_from_capture"] = self.capture_check.isChecked()
         self.accept()
