@@ -47,7 +47,13 @@ def _loopback_device(pa, pyaudio):
         wasapi = pa.get_host_api_info_by_type(pyaudio.paWASAPI)
     except OSError as e:
         raise AudioError("В Windows не найден WASAPI — звук компьютера записать нельзя.") from e
-    speakers = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+    try:
+        if wasapi["defaultOutputDevice"] < 0:
+            raise OSError("нет устройства по умолчанию")
+        speakers = pa.get_device_info_by_index(wasapi["defaultOutputDevice"])
+    except OSError as e:
+        raise AudioError("Не найдены динамики или наушники: подключи их или выбери устройство вывода "
+                         "по умолчанию (значок динамика в трее).") from e
     if speakers.get("isLoopbackDevice"):
         return speakers
     for dev in pa.get_loopback_device_info_generator():
@@ -207,9 +213,9 @@ def selftest(out_path) -> int:
         try:
             lines.append(f"PortAudio: {pyaudio.get_portaudio_version_text()}")
             lines.append(f"устройств: {pa.get_device_count()}")
-            try:
+            try:  # на машине без звуковых устройств это не ошибка сборки
                 lines.append(f"loopback: {_loopback_device(pa, pyaudio)['name']}")
-            except AudioError as e:
+            except Exception as e:
                 lines.append(f"loopback: нет ({e})")
         finally:
             pa.terminate()
