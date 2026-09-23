@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 
 from . import winapi
 from .logo import beetle_pixmap
+from .mathfmt import keep_line_breaks, latex_to_plain
 
 RADIUS = 18
 BG_COLOR = QColor(18, 52, 120, 205)
@@ -215,8 +216,9 @@ class MainWindow(QWidget):
     def show_answer(self, text):
         self._busy_timer.stop()
         self._set_busy_buttons(False)
+        text = latex_to_plain(text)  # модели любят писать формулы как $17 \times 3$
         self._answer_text = text
-        self.view.setMarkdown(text)
+        self.view.setMarkdown(keep_line_breaks(text))
         self.btn_copy.setEnabled(True)
 
     def show_error(self, text):
