@@ -68,7 +68,8 @@ async def _recognize_async(img: QImage) -> list:
     raw = bytes(img.constBits())  # у 32-битных форматов строка всегда ровно width * 4 байт
     writer = DataWriter()
     writer.write_bytes(raw)
-    bitmap = SoftwareBitmap.create_copy_from_buffer(
+    # В pywinrt вариант с режимом альфа-канала — отдельный метод, а не перегрузка create_copy_from_buffer.
+    bitmap = SoftwareBitmap.create_copy_with_alpha_from_buffer(
         writer.detach_buffer(), BitmapPixelFormat.BGRA8, width, height, BitmapAlphaMode.PREMULTIPLIED)
 
     results = []
