@@ -4,7 +4,7 @@ import time
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QSizeGrip, QTextBrowser, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QMenu, QPushButton, QSizeGrip, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from . import winapi
@@ -36,6 +36,11 @@ QPushButton#stop {
 }
 QPushButton#stop:hover { background: rgba(255,90,90,0.45); }
 QPushButton#copy:disabled { color: rgba(234,244,255,0.4); }
+QPushButton#update {
+    background: rgba(80,200,120,0.28); border: 1px solid rgba(140,240,170,0.55);
+    border-radius: 9px; padding: 5px 10px;
+}
+QPushButton#update:hover { background: rgba(80,200,120,0.45); }
 QTextBrowser {
     background: rgba(5,20,55,0.35); border: 1px solid rgba(160,210,255,0.2);
     border-radius: 12px; padding: 8px; selection-background-color: #3a7bff;
@@ -51,6 +56,8 @@ class MainWindow(QWidget):
     settings_requested = Signal()
     quit_requested = Signal()
     stop_requested = Signal()
+    prompt_chosen = Signal(int)
+    update_requested = Signal()
     geometry_changed = Signal(list)
 
     def __init__(self, hide_from_capture=True):
@@ -79,9 +86,18 @@ class MainWindow(QWidget):
         logo = QLabel()
         logo.setPixmap(beetle_pixmap(26))
         title = QLabel("ZhukoGPT", objectName="title")
+        self.btn_prompt = QPushButton("📝", objectName="icon", toolTip="Промпт")
+        self.prompt_menu = QMenu(self)
+        self.prompt_menu.setStyleSheet(
+            "QMenu { background: #10306e; color: #eaf4ff; border: 1px solid rgba(160,210,255,0.35);"
+            " border-radius: 8px; padding: 4px; }"
+            "QMenu::item { padding: 5px 18px 5px 22px; border-radius: 6px; }"
+            "QMenu::item:selected { background: #3a7bff; }")
+        self.btn_prompt.clicked.connect(
+            lambda: self.prompt_menu.exec(self.btn_prompt.mapToGlobal(self.btn_prompt.rect().bottomLeft())))
         btn_settings = QPushButton("⚙", objectName="icon", toolTip="Настройки")
         btn_close = QPushButton("✕", objectName="close", toolTip="Выход")
-        for b in (btn_settings, btn_close):
+        for b in (self.btn_prompt, btn_settings, btn_close):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
         btn_settings.clicked.connect(self.settings_requested)
@@ -89,6 +105,7 @@ class MainWindow(QWidget):
         header.addWidget(logo)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.btn_prompt)
         header.addWidget(btn_settings)
         header.addWidget(btn_close)
         self.header.setCursor(Qt.SizeAllCursor)
@@ -115,7 +132,13 @@ class MainWindow(QWidget):
         self.btn_stop.setFocusPolicy(Qt.NoFocus)
         self.btn_stop.clicked.connect(self.stop_requested)
         self.btn_stop.hide()
+        self.btn_update = QPushButton(objectName="update")
+        self.btn_update.setCursor(Qt.PointingHandCursor)
+        self.btn_update.setFocusPolicy(Qt.NoFocus)
+        self.btn_update.clicked.connect(self.update_requested)
+        self.btn_update.hide()
         bottom.addWidget(self.status, 1)
+        bottom.addWidget(self.btn_update)
         bottom.addWidget(self.btn_copy)
         bottom.addWidget(self.btn_stop)
         bottom.addWidget(QSizeGrip(self), 0, Qt.AlignBottom | Qt.AlignRight)
@@ -181,6 +204,30 @@ class MainWindow(QWidget):
 
     def mouseReleaseEvent(self, e):
         self._drag_offset = None
+
+    # --- обновление ---
+    def show_update(self, version):
+        self.btn_update.setText(f"⬆ {version}")
+        self.btn_update.setToolTip(f"Доступна новая версия ZhukoGPT {version} — нажми, чтобы обновиться")
+        self.btn_update.setEnabled(True)
+        self.btn_update.show()
+
+    def set_update_progress(self, percent):
+        self.btn_update.setText(f"⬇ {percent}%")
+        self.btn_update.setEnabled(False)
+
+    # --- промпты ---
+    def set_prompts(self, names, active):
+        """Меню кнопки 📝: список промптов, выбранный отмечен галочкой."""
+        self.prompt_menu.clear()
+        for i, name in enumerate(names):
+            action = self.prompt_menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(i == active)
+            action.triggered.connect(lambda _checked=False, idx=i: self.prompt_chosen.emit(idx))
+        self.prompt_menu.addSeparator()
+        self.prompt_menu.addAction("Изменить промпты…").triggered.connect(self.settings_requested)
+        self.btn_prompt.setToolTip(f"Промпт: {names[active]}")
 
     # --- состояние ---
     def set_status(self, text):

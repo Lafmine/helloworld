@@ -1,4 +1,4 @@
-"""Запросы к ИИ-сервисам (Groq, Gemini, NVIDIA, OpenRouter, TeamoRouter) — все совместимы с API OpenAI."""
+"""Запросы к ИИ-сервисам (Groq, Gemini, OrcaRouter, NVIDIA, OpenRouter, TeamoRouter) — все совместимы с API OpenAI."""
 import base64
 import json
 import threading
@@ -10,8 +10,8 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QThread, Qt, Signal
 from PySide6.QtGui import QImage
 
 from . import ocr
-from .config import (APP_NAME, PROVIDERS, SYSTEM_PROMPT, SYSTEM_PROMPT_TEXT, USER_PROMPT,
-                     USER_PROMPT_TEXT)
+from .config import (APP_NAME, DEFAULT_PROMPTS, PROVIDERS, USER_PROMPT, USER_PROMPT_TEXT,
+                     build_system_prompt)
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 TEAMO_PROBE_MODEL = "deepseek-v4-flash-free"
@@ -24,6 +24,10 @@ MAX_IMAGE_SIDE = 1600
 _EXCLUDE_WORDS = ("safety", "guard")
 NVIDIA_PROBE_MODEL = "deepseek-ai/deepseek-v4.1-flash"
 GROQ_PROBE_MODEL = "qwen/qwen3.8-27b"
+ORCA_PROBE_MODEL = "deepseek/deepseek-v4-flash-free"
+# glm-5.3-flash по описанию в каталоге OrcaRouter принимает «text + image + video».
+_ORCA_VISION_WORDS = ("glm-5.3-flash", "vision", "-vl")
+_ORCA_NOT_CHAT = ("orcaverify", "embed", "rerank", "tts", "whisper", "image-gen", "moderation")
 _GROQ_VISION_WORDS = ("qwen3.8", "vision", "-vl", "scout", "maverick")
 _GROQ_NOT_CHAT = ("whisper", "orpheus", "guard", "safeguard", "allam", "tts", "distil")
 _GEMINI_NOT_CHAT = ("embedding", "tts", "image", "live", "audio", "aqa", "robotics", "computer-use")
@@ -68,6 +72,8 @@ def has_vision(provider: str, model: str) -> bool:
         return name.startswith("gemini")  # все Gemini Flash мультимодальные
     if provider == "groq":
         return any(w in name for w in _GROQ_VISION_WORDS)
+    if provider == "orcarouter":
+        return any(w in name for w in _ORCA_VISION_WORDS)
     if provider == "nvidia" and any(w in name for w in _NVIDIA_VISION_WORDS):
         return True
     return "vision" in name or "-vl" in name or name.endswith("vl")
@@ -81,17 +87,19 @@ def _headers(provider, api_key):
     return headers
 
 
-def build_payload(provider: str, model: str, png_bytes: bytes = None, text: str = None) -> dict:
+def build_payload(provider: str, model: str, png_bytes: bytes = None, text: str = None,
+                  prompt_text: str = None) -> dict:
     """Запрос с картинкой или, для моделей без зрения, с распознанным текстом."""
+    prompt_text = prompt_text or DEFAULT_PROMPTS[0]["text"]
     if text is not None:
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT_TEXT},
+            {"role": "system", "content": build_system_prompt(prompt_text, ocr=True)},
             {"role": "user", "content": USER_PROMPT_TEXT + text},
         ]
     else:
         image_b64 = base64.b64encode(png_bytes).decode("ascii")
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt(prompt_text, ocr=False)},
             {
                 "role": "user",
                 "content": [
@@ -155,6 +163,16 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
     meta = error.get("metadata") or {}
     reset_ms = headers.get("X-RateLimit-Reset")
 
+    code = str(error.get("code") or "").lower()
+    reason = str((meta or {}).get("reason") or "").lower()
+    if code == "free_rate_limited" and ("access_denied" in reason or "not available to this account" in text):
+        return ApiError("free_access", f"Бесплатные модели {name} для твоего аккаунта ещё закрыты. "
+                        "Открой настройки профиля на orcarouter.ai и привяжи GitHub-аккаунт, "
+                        "который зарегистрирован давно (новый не подойдёт). После этого free-модели заработают.",
+                        detail, status)
+    if code == "free_quota_exhausted":
+        return ApiError("daily_limit", f"Бесплатный лимит {name} на сегодня закончился. "
+                        "Попробуй позже или выбери другой сервис в ⚙.", detail, status)
     if _is_balance_error(error, text):
         return ApiError("balance", f"На балансе {name} нет денег. Даже бесплатные (free) модели там работают "
                         f"только при ненулевом балансе. Пополнить: {PROVIDERS[provider]['keys_page']}",
@@ -189,7 +207,7 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
         limit = {
             "nvidia": " (бесплатный лимит NVIDIA — около 40 запросов в минуту)",
             "groq": " (бесплатный лимит Groq: 1000 запросов в день и 8000 токенов в минуту — "
-                    "примерно 7 скриншотов в минуту)",
+                    "это несколько скриншотов в минуту)",
             "gemini": " (бесплатный лимит Gemini)",
         }.get(provider, "")
         return ApiError("minute_limit", f"Слишком много запросов подряд{limit}. Подожди минуту.",
@@ -319,7 +337,7 @@ def _recognize_text(png_bytes: bytes) -> str:
 
 
 def ask_with_fallback(provider: str, api_key: str, models: list, png_bytes: bytes,
-                      on_try=None, on_status=None, req=None):
+                      on_try=None, on_status=None, req=None, prompt_text=None):
     """Спрашивает первую модель, при временных сбоях — следующие. Возвращает (текст, модель)."""
     name = provider_name(provider)
     if not api_key:
@@ -346,14 +364,15 @@ def ask_with_fallback(provider: str, api_key: str, models: list, png_bytes: byte
                 _check_cancel(req)
             if on_status:
                 on_status(f"Модель: {model} (по распознанному тексту)")
-            return build_payload(provider, model, text=ocr_text)
+            return build_payload(provider, model, text=ocr_text, prompt_text=prompt_text)
 
         try:
             if has_vision(provider, model):
                 if small_png is None:
                     small_png = downscale_png(png_bytes)
                 try:
-                    return _ask_once(provider, api_key, build_payload(provider, model, png_bytes=small_png), req), model
+                    return _ask_once(provider, api_key, build_payload(provider, model, png_bytes=small_png,
+                                                                          prompt_text=prompt_text), req), model
                 except ApiError as e:
                     if e.kind != "no_vision":
                         raise
@@ -380,6 +399,8 @@ def check_key(provider: str, api_key: str) -> dict:
         return _check_nvidia_key(api_key)
     if provider in ("groq", "gemini"):
         return _check_listed_key(provider, api_key)
+    if provider == "orcarouter":
+        return _check_orca_key(api_key)
     try:
         resp = requests.get(OPENROUTER_KEY_URL, headers=_headers(provider, api_key), timeout=20)
     except requests.RequestException as e:
@@ -460,6 +481,29 @@ def _check_listed_key(provider: str, api_key: str) -> dict:
     return info
 
 
+def _check_orca_key(api_key: str) -> dict:
+    # Список моделей OrcaRouter открыт всем — проверяем ключ пробным запросом к бесплатной DeepSeek.
+    try:
+        resp = requests.post(PROVIDERS["orcarouter"]["chat_url"], headers=_headers("orcarouter", api_key),
+                             timeout=30, json={"model": ORCA_PROBE_MODEL, "max_tokens": 1,
+                                               "messages": [{"role": "user", "content": "1"}]})
+    except requests.RequestException as e:
+        return {"valid": None, "error": f"Нет соединения: {e}"}
+    if resp.status_code in (401, 403):
+        return {"valid": False, "error": "Неверный ключ"}
+    if resp.status_code == 200:
+        return {"valid": True, "deepseek_ok": True}
+    try:
+        err = resp.json().get("error") or {}
+    except ValueError:
+        err = {}
+    if str(err.get("code")) == "free_rate_limited":
+        return {"valid": True, "free_locked": True}
+    if str(err.get("code")) == "free_quota_exhausted":
+        return {"valid": True, "rate_limited": True}
+    return {"valid": True, "probe_status": resp.status_code}
+
+
 def _check_nvidia_key(api_key: str) -> dict:
     # Список моделей NVIDIA открыт всем, поэтому ключ проверяем крошечным запросом к DeepSeek.
     try:
@@ -487,6 +531,8 @@ def describe_key(info: dict) -> str:
         parts.append("⚠ на балансе 0 — даже free-модели не ответят, пока баланс не пополнен")
     elif info.get("free_ok"):
         parts.append("бесплатные модели отвечают")
+    elif info.get("free_locked"):
+        parts.append("⚠ free-модели закрыты: привяжи давний GitHub-аккаунт в профиле orcarouter.ai")
     elif info.get("deepseek_ok"):
         parts.append("DeepSeek отвечает")
     elif info.get("rate_limited"):
@@ -527,6 +573,12 @@ def fetch_models(provider: str, api_key: str = "") -> list:
         elif provider == "nvidia":
             if not any(w in model_id.lower() for w in _NVIDIA_NOT_CHAT):
                 result.append(model_id)
+        elif provider == "orcarouter":
+            price = m.get("pricing") or {}
+            nums = [float(v) for v in price.values() if str(v).replace(".", "", 1).isdigit()]
+            free = model_id == "orcarouter/free" or (nums and all(v == 0 for v in nums))
+            if free and not any(w in model_id.lower() for w in _ORCA_NOT_CHAT):
+                result.append(model_id)
         elif provider == "groq":
             if m.get("active", True) and not any(w in model_id.lower() for w in _GROQ_NOT_CHAT):
                 result.append(model_id)
@@ -538,6 +590,9 @@ def fetch_models(provider: str, api_key: str = "") -> list:
             result.append(model_id)
     if provider == "openrouter":
         return sorted(result)
+    if provider == "orcarouter":  # сначала DeepSeek, потом со зрением, автовыбор в конце
+        return sorted(result, key=lambda mid: ("deepseek" not in mid, not has_vision(provider, mid),
+                                               mid == "orcarouter/free", mid))
     if provider in ("groq", "gemini"):  # сверху модели со зрением (у Gemini — flash)
         return sorted(result, key=lambda mid: (not has_vision(provider, mid), "flash" not in mid, mid))
     if provider == "nvidia":  # сначала DeepSeek, потом модели со зрением, потом остальные
@@ -552,9 +607,10 @@ class AskWorker(QThread):
     failed = Signal(str)
     cancelled = Signal()
 
-    def __init__(self, provider, api_key, models, png_bytes, parent=None):
+    def __init__(self, provider, api_key, models, png_bytes, prompt_text=None, parent=None):
         super().__init__(parent)
         self._args = (provider, api_key, list(models), png_bytes)
+        self._prompt_text = prompt_text
         self._req = _Request()
 
     def cancel(self):
@@ -565,14 +621,15 @@ class AskWorker(QThread):
         provider, api_key, models, png = self._args
         try:
             text, model = ask_with_fallback(provider, api_key, models, png, on_try=self.trying.emit,
-                                            on_status=self.status.emit, req=self._req)
+                                            on_status=self.status.emit, req=self._req,
+                                            prompt_text=self._prompt_text)
             self.finished_ok.emit(text, model)
         except ApiError as e:
             if e.kind == "cancelled" or self._req.cancel_event.is_set():
                 self.cancelled.emit()
                 return
             message = e.full_text()
-            if e.kind == "daily_limit":
+            if e.kind == "daily_limit" and provider == "openrouter":
                 info = check_key(provider, api_key)
                 if info.get("valid"):
                     message += f"\n\n{describe_key(info)}"

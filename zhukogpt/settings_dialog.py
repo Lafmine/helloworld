@@ -6,7 +6,7 @@ from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QKeySequenceEdit, QLabel,
-    QLineEdit, QPushButton, QVBoxLayout,
+    QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
 from . import winapi
@@ -21,7 +21,7 @@ QLabel#title { font-size: 13pt; font-weight: 600; }
 QLabel#hint { color: #a9c8f0; font-size: 9pt; }
 QLabel#error { color: #ffb4b4; font-size: 9pt; }
 QLabel a { color: #8fd8ff; }
-QLineEdit, QComboBox, QKeySequenceEdit QLineEdit {
+QLineEdit, QComboBox, QKeySequenceEdit QLineEdit, QPlainTextEdit {
     background: rgba(5,20,55,0.55); border: 1px solid rgba(160,210,255,0.35);
     border-radius: 8px; padding: 5px 8px; selection-background-color: #3a7bff;
 }
@@ -52,18 +52,101 @@ def key_hint(provider):
     return f'Где взять ключ: <a style="color:#8fd8ff" href="{url}">{html.escape(host)}</a>'
 
 
-class SettingsDialog(QDialog):
-    def __init__(self, cfg: dict, parent=None):
+class GlassDialog(QDialog):
+    """Безрамочный полупрозрачный диалог поверх всех окон, который можно таскать мышкой."""
+
+    def __init__(self, parent=None, hide_from_capture=True):
         super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setWindowTitle("Настройки ZhukoGPT")
         self.setStyleSheet(DIALOG_STYLE)
+        self._hide_from_capture = hide_from_capture
+        self._drag_offset = None
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        winapi.set_capture_hidden(int(self.winId()), self._hide_from_capture)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), RADIUS, RADIUS)
+        p.fillPath(path, QColor(16, 46, 108, 240))  # плотнее, чтобы поля читались
+        p.setPen(QPen(BORDER_COLOR, 1.2))
+        p.drawPath(path)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is not None and e.buttons() & Qt.LeftButton:
+            self.move(e.globalPosition().toPoint() - self._drag_offset)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_offset = None
+
+
+class PromptEditDialog(GlassDialog):
+    """Редактор одного промпта: название и текст задачи для ИИ."""
+
+    def __init__(self, name="", text="", parent=None, hide_from_capture=True):
+        super().__init__(parent, hide_from_capture)
+        self.setWindowTitle("Промпт")
+        self.setMinimumSize(520, 380)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 14, 20, 16)
+        root.setSpacing(8)
+        root.addWidget(QLabel("📝  Промпт", objectName="title"))
+        root.addWidget(QLabel("Название:"))
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("Например: «Решить по химии»")
+        root.addWidget(self.name_edit)
+        root.addWidget(QLabel("Что ИИ должен сделать со скриншотом:"))
+        self.text_edit = QPlainTextEdit(text)
+        self.text_edit.setPlaceholderText(
+            "Например: «Реши задачу по химии, напиши уравнения реакций и ответ с единицами измерения».")
+        root.addWidget(self.text_edit, 1)
+        root.addWidget(QLabel("Правила «отвечай по-русски» и «без LaTeX» добавляются автоматически.",
+                              objectName="hint"))
+        self.error_label = QLabel(objectName="error")
+        self.error_label.hide()
+        root.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        btn_cancel = QPushButton("Отмена")
+        btn_ok = QPushButton("Готово", objectName="primary")
+        btn_cancel.clicked.connect(self.reject)
+        btn_ok.clicked.connect(self._accept)
+        buttons.addWidget(btn_cancel)
+        buttons.addWidget(btn_ok)
+        root.addLayout(buttons)
+        self.text_edit.setFocus() if name else self.name_edit.setFocus()
+
+    def _accept(self):
+        if not self.text_edit.toPlainText().strip():
+            self.error_label.setText("Напиши, что ИИ должен сделать.")
+            self.error_label.show()
+            return
+        self.accept()
+
+    def result_prompt(self):
+        name = self.name_edit.text().strip() or self.text_edit.toPlainText().strip()[:30]
+        return {"name": name, "text": self.text_edit.toPlainText().strip()}
+
+
+class SettingsDialog(GlassDialog):
+    def __init__(self, cfg: dict, parent=None):
+        super().__init__(parent, cfg.get("hide_from_capture", True))
+        self.setWindowTitle("Настройки ZhukoGPT")
         self.setMinimumWidth(600)
         self._cfg = cfg
+        self._prompts = copy.deepcopy(cfg["prompts"])
+        self._active_prompt = cfg["active_prompt"]
         # Черновики ключа и моделей каждого сервиса, пока диалог открыт.
         self._drafts = copy.deepcopy(cfg["providers"])
         self._provider = cfg["provider"]
-        self._drag_offset = None
         self._models_worker = None
         self._key_worker = None
 
@@ -125,6 +208,26 @@ class SettingsDialog(QDialog):
         self.models_hint.setWordWrap(True)
         form.addRow("", self.models_hint)
 
+        # Промпт
+        self.prompt_combo = QComboBox()
+        self.prompt_combo.currentIndexChanged.connect(self._prompt_selected)
+        form.addRow("Промпт:", self.prompt_combo)
+        prompt_buttons = QHBoxLayout()
+        prompt_buttons.setSpacing(8)
+        btn_edit = QPushButton("✎ Изменить")
+        btn_add = QPushButton("+ Новый")
+        self.btn_del_prompt = QPushButton("Удалить")
+        btn_edit.clicked.connect(self._edit_prompt)
+        btn_add.clicked.connect(self._add_prompt)
+        self.btn_del_prompt.clicked.connect(self._delete_prompt)
+        for b in (btn_edit, btn_add, self.btn_del_prompt):
+            prompt_buttons.addWidget(b)
+        prompt_buttons.addStretch(1)
+        form.addRow("", prompt_buttons)
+        self.prompt_hint = QLabel(objectName="hint")
+        form.addRow("", self.prompt_hint)
+        self._fill_prompts()
+
         # Бинды
         self.hotkey_edits = {}
         for action, title in HOTKEY_ACTIONS.items():
@@ -140,6 +243,10 @@ class SettingsDialog(QDialog):
         self.capture_check = QCheckBox("Скрывать окно от записи и демонстрации экрана (Discord, OBS…)")
         self.capture_check.setChecked(cfg.get("hide_from_capture", True))
         root.addWidget(self.capture_check)
+
+        self.update_check = QCheckBox("Проверять обновления при запуске")
+        self.update_check.setChecked(cfg.get("auto_update", True))
+        root.addWidget(self.update_check)
 
         self.error_label = QLabel(objectName="error")
         self.error_label.setWordWrap(True)
@@ -160,6 +267,46 @@ class SettingsDialog(QDialog):
         self.provider_combo.setCurrentIndex(self.provider_combo.findData(self._provider))
         self._load_provider(self._provider)
         self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+
+    # --- промпты ---
+    def _fill_prompts(self):
+        self.prompt_combo.blockSignals(True)
+        self.prompt_combo.clear()
+        self.prompt_combo.addItems([p["name"] for p in self._prompts])
+        self.prompt_combo.setCurrentIndex(self._active_prompt)
+        self.prompt_combo.blockSignals(False)
+        self._prompt_selected(self._active_prompt)
+
+    def _prompt_selected(self, index):
+        if 0 <= index < len(self._prompts):
+            self._active_prompt = index
+            text = " ".join(self._prompts[index]["text"].split())  # в одну строку
+            self.prompt_hint.setText(text if len(text) <= 80 else text[:80].rstrip() + "…")
+        self.btn_del_prompt.setEnabled(len(self._prompts) > 1)
+
+    def _open_prompt_editor(self, prompt):
+        dlg = PromptEditDialog(prompt.get("name", ""), prompt.get("text", ""), self,
+                               self._cfg.get("hide_from_capture", True))
+        return dlg.result_prompt() if dlg.exec() else None
+
+    def _edit_prompt(self):
+        edited = self._open_prompt_editor(self._prompts[self._active_prompt])
+        if edited:
+            self._prompts[self._active_prompt] = edited
+            self._fill_prompts()
+
+    def _add_prompt(self):
+        created = self._open_prompt_editor({})
+        if created:
+            self._prompts.append(created)
+            self._active_prompt = len(self._prompts) - 1
+            self._fill_prompts()
+
+    def _delete_prompt(self):
+        if len(self._prompts) > 1:
+            del self._prompts[self._active_prompt]
+            self._active_prompt = max(0, self._active_prompt - 1)
+            self._fill_prompts()
 
     # --- сервисы ---
     def _stash(self):
@@ -270,35 +417,11 @@ class SettingsDialog(QDialog):
         self._cfg["providers"] = self._drafts
         self._cfg["hotkeys"] = hotkeys
         self._cfg["hide_from_capture"] = self.capture_check.isChecked()
+        self._cfg["auto_update"] = self.update_check.isChecked()
+        self._cfg["prompts"] = self._prompts
+        self._cfg["active_prompt"] = self._active_prompt
         self.accept()
 
     def _show_error(self, text):
         self.error_label.setText(text)
         self.error_label.show()
-
-    # --- вид и перетаскивание ---
-    def showEvent(self, e):
-        super().showEvent(e)
-        hwnd = int(self.winId())
-        winapi.set_capture_hidden(hwnd, self._cfg.get("hide_from_capture", True))
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        path = QPainterPath()
-        path.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), RADIUS, RADIUS)
-        p.fillPath(path, QColor(16, 46, 108, 240))  # плотнее, чтобы поля читались
-        p.setPen(QPen(BORDER_COLOR, 1.2))
-        p.drawPath(path)
-        p.end()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton:
-            self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
-
-    def mouseMoveEvent(self, e):
-        if self._drag_offset is not None and e.buttons() & Qt.LeftButton:
-            self.move(e.globalPosition().toPoint() - self._drag_offset)
-
-    def mouseReleaseEvent(self, e):
-        self._drag_offset = None

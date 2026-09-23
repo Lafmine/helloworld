@@ -2,12 +2,13 @@
 import copy
 import os
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QTimer
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QLockFile, QTimer, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import config
+from . import config, updater
 from .api import AskWorker
 from .hotkeys import HotkeyManager
 from .logo import beetle_icon
@@ -33,6 +34,11 @@ class ZhukoApp:
         self.window.settings_requested.connect(self.open_settings)
         self.window.quit_requested.connect(self.quit)
         self.window.stop_requested.connect(self.stop_request)
+        self.window.prompt_chosen.connect(self._choose_prompt)
+        self.window.update_requested.connect(self._start_update)
+        self._update_info = None
+        self._update_worker = None
+        self._update_prompt_menu()
         self.window.geometry_changed.connect(self._save_geometry)
 
         self.hotkeys = HotkeyManager(app)
@@ -44,6 +50,9 @@ class ZhukoApp:
         if not config.active(self.cfg).get("api_key"):
             # Первый запуск: без ключа сервиса работать нельзя — сразу открываем настройки.
             QTimer.singleShot(300, self.open_settings)
+        updater.cleanup_old()
+        if self.cfg.get("auto_update", True) and updater.is_frozen():
+            QTimer.singleShot(4000, self.check_updates)
 
     # --- хоткеи ---
     def _register_hotkeys(self):
@@ -71,7 +80,8 @@ class ZhukoApp:
             lines += [f"**Сначала вставь API-ключ {info['name']}** в настройках ⚙ "
                       f"([{info['keys_page'].split('://', 1)[-1]}]({info['keys_page']})).", ""]
         else:
-            lines += [f"Сервис: **{info['name']}**, модель: `{current['model']}`", ""]
+            lines += [f"Сервис: **{info['name']}**, модель: `{current['model']}`",
+                      f"Промпт: **{config.active_prompt(self.cfg)['name']}** (сменить — кнопка 📝)", ""]
         lines += [
             f"- **{hk.get('screenshot', '—')}** — выделить область и решить задание",
             f"- **{hk.get('toggle', '—')}** — показать / скрыть окно",
@@ -151,7 +161,9 @@ class ZhukoApp:
         # Выбранная модель первой, остальные из списка — запасные при перегрузке провайдера.
         models = [model] + [m for m in current.get("models", []) if m != model]
         self.window.set_busy(model)
-        self.worker = AskWorker(self.cfg["provider"], current.get("api_key", ""), models, png)
+        prompt = config.active_prompt(self.cfg)
+        self.worker = AskWorker(self.cfg["provider"], current.get("api_key", ""), models, png,
+                                prompt_text=prompt["text"])
         self.worker.trying.connect(self._on_trying)
         self.worker.status.connect(self.window.set_busy_status)
         self.worker.finished_ok.connect(self._on_answer)
@@ -206,9 +218,61 @@ class ZhukoApp:
             config.save(self.cfg)
             self.window.hide_from_capture = self.cfg["hide_from_capture"]
             self.window.apply_window_flags()
+            self._update_prompt_menu()
         self._register_hotkeys()
         if accepted and self.last_png is None:
             self._show_welcome()  # обновить подсказки с новыми биндами
+
+    # --- обновление ---
+    def check_updates(self):
+        self._update_worker = updater.UpdateChecker()
+        self._update_worker.found.connect(self._on_update_found)
+        self._update_worker.start()  # тихо: ошибки сети при проверке не показываем
+
+    def _on_update_found(self, info):
+        self._update_info = info
+        self.window.show_update(info["version"])
+        if not (self.worker and self.worker.isRunning()):
+            self.window.set_status(f"Вышла версия {info['version']} — нажми «⬆ {info['version']}», чтобы обновиться")
+
+    def _start_update(self):
+        info = self._update_info
+        if not info or not info.get("url") or not updater.is_frozen():
+            QDesktopServices.openUrl(QUrl(updater.RELEASES_PAGE))
+            return
+        self.window.set_update_progress(0)
+        self.window.set_status(f"Скачиваю ZhukoGPT {info['version']}…")
+        self._update_worker = updater.UpdateDownloader(info["url"])
+        self._update_worker.progress.connect(self.window.set_update_progress)
+        self._update_worker.done.connect(self._install_update)
+        self._update_worker.failed.connect(self._update_failed)
+        self._update_worker.start()
+
+    def _install_update(self, path):
+        try:
+            updater.install(Path(path))
+        except Exception as e:
+            self._update_failed(str(e))
+            return
+        self.quit()  # новый exe уже запущен и ждёт, пока этот закроется
+
+    def _update_failed(self, err):
+        self.window.show_update(self._update_info["version"])
+        self.window.show_error(f"Не удалось обновиться автоматически: {err}\n\n"
+                               f"Скачай новую версию вручную: [{updater.RELEASES_PAGE}]({updater.RELEASES_PAGE})")
+        self.window.set_status(self._ready_text())
+
+    def _update_prompt_menu(self):
+        self.window.set_prompts([p["name"] for p in self.cfg["prompts"]], self.cfg["active_prompt"])
+
+    def _choose_prompt(self, index):
+        self.cfg["active_prompt"] = index
+        config.save(self.cfg)
+        self._update_prompt_menu()
+        name = config.active_prompt(self.cfg)["name"]
+        self.window.set_status(f"Промпт: {name} • {self.cfg['hotkeys'].get('screenshot', '')} — скриншот")
+        if self.last_png is None:
+            self._show_welcome()
 
     def _save_geometry(self, geometry):
         self.cfg["geometry"] = geometry
@@ -236,7 +300,9 @@ def main():
 
     config.config_dir().mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(config.config_dir() / "zhukogpt.lock"))
-    if not lock.tryLock(100):
+    # После обновления прошлый exe ещё пару секунд закрывается — ждём его, а не пишем «уже запущен».
+    wait_ms = 10000 if updater.AFTER_UPDATE_FLAG in sys.argv else 100
+    if not lock.tryLock(wait_ms):
         QMessageBox.information(None, config.APP_NAME, "ZhukoGPT уже запущен.")
         return 0
 
