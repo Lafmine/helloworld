@@ -5,10 +5,23 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.1.1"
+VERSION = "1.2.0"
 
 # Сервисы с API, совместимым с OpenAI. Ключи пользователь вводит в настройках, здесь их нет.
 PROVIDERS = {
+    "nvidia": {
+        "name": "NVIDIA (бесплатно)",
+        "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models_url": "https://integrate.api.nvidia.com/v1/models",
+        "keys_page": "https://build.nvidia.com/settings/api-keys",
+        "key_placeholder": "nvapi-…",
+        "default_models": [
+            "deepseek-ai/deepseek-v4.1-flash",
+            "google/gemma-4-31b-it",
+            "meta/llama-3.2-90b-vision-instruct",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        ],
+    },
     "openrouter": {
         "name": "OpenRouter",
         "chat_url": "https://openrouter.ai/api/v1/chat/completions",
@@ -38,7 +51,7 @@ PROVIDERS = {
         ],
     },
 }
-DEFAULT_PROVIDER = "openrouter"
+DEFAULT_PROVIDER = "nvidia"
 DEFAULT_MODELS = PROVIDERS["openrouter"]["default_models"]  # для совместимости
 
 _ANSWER_FORMAT = (
@@ -136,6 +149,8 @@ def load() -> dict:
             _merge_provider(cfg["providers"][pid], value)
     if saved.get("provider") in PROVIDERS:
         cfg["provider"] = saved["provider"]
+    elif saved.get("api_key"):
+        cfg["provider"] = "openrouter"  # у 1.0.x был только OpenRouter — оставляем его
     if isinstance(saved.get("hotkeys"), dict):
         cfg["hotkeys"].update(saved["hotkeys"])
     for key in ("hide_from_capture", "geometry"):

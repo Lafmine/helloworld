@@ -41,11 +41,15 @@ QCheckBox::indicator { width: 16px; height: 16px; }
 """
 
 
+def short_name(provider):
+    return PROVIDERS[provider]["name"].split(" (")[0]  # «NVIDIA (бесплатно)» → «NVIDIA»
+
+
 def key_hint(provider):
     info = PROVIDERS[provider]
     url = info["keys_page"]
-    label = url.split("://", 1)[-1]
-    return f'Ключ {info["name"]}: <a style="color:#8fd8ff" href="{url}">{html.escape(label)}</a>'
+    host = url.split("://", 1)[-1].split("/", 1)[0]
+    return f'Где взять ключ: <a style="color:#8fd8ff" href="{url}">{html.escape(host)}</a>'
 
 
 class SettingsDialog(QDialog):
@@ -168,7 +172,7 @@ class SettingsDialog(QDialog):
     def _load_provider(self, provider):
         info = PROVIDERS[provider]
         draft = self._drafts[provider]
-        self.key_label.setText(f"API-ключ {info['name']}:")
+        self.key_label.setText(f"API-ключ {short_name(provider)}:")
         self.key_edit.setText(draft.get("api_key", ""))
         self.key_edit.setPlaceholderText(info["key_placeholder"])
         self.key_hint.setText(key_hint(provider))

@@ -1,4 +1,4 @@
-"""Запросы к ИИ-сервисам (OpenRouter, TeamoRouter) — оба совместимы с API OpenAI."""
+"""Запросы к ИИ-сервисам (NVIDIA, OpenRouter, TeamoRouter) — все совместимы с API OpenAI."""
 import base64
 import json
 import threading
@@ -22,6 +22,12 @@ MAX_FALLBACKS = 2  # сколько запасных моделей пробов
 MAX_IMAGE_SIDE = 1600
 
 _EXCLUDE_WORDS = ("safety", "guard")
+NVIDIA_PROBE_MODEL = "deepseek-ai/deepseek-v4.1-flash"
+# Модели каталога NVIDIA, которые принимают картинки (по их карточкам на build.nvidia.com).
+_NVIDIA_VISION_WORDS = ("deepseek-v4.1-flash", "gemma-4", "omni", "phi-3-vision", "phi-4-multimodal")
+# Всё, что в каталоге NVIDIA не является чат-моделью.
+_NVIDIA_NOT_CHAT = ("embed", "rerank", "reward", "retriever", "guard", "safety", "coder", "code-",
+                    "parse", "clip", "diffusion", "vlm-embed", "nemoretriever", "pii", "translate")
 # При этих ошибках имеет смысл попробовать другую модель.
 _RETRYABLE = {"upstream", "unavailable", "server", "timeout", "empty"}
 
@@ -54,6 +60,8 @@ def has_vision(provider: str, model: str) -> bool:
     if provider == "openrouter":
         return True  # в списке OpenRouter только модели с картинками
     name = model.lower()
+    if provider == "nvidia" and any(w in name for w in _NVIDIA_VISION_WORDS):
+        return True
     return "vision" in name or "-vl" in name or name.endswith("vl")
 
 
@@ -152,7 +160,9 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
                         detail, status)
     if status == 403:
         return ApiError("other", f"{name} отклонил запрос (модерация или ограничения ключа).", detail, status)
-    if status == 404 or "does not support image" in text:
+    if status in (400, 415, 422) and any(w in text for w in ("image", "multimodal", "vision")):
+        return ApiError("no_vision", "Модель не принимает картинки.", detail, status)
+    if status == 404:
         return ApiError("unavailable", "Модель сейчас недоступна.", detail, status)
     if status == 408:
         return ApiError("timeout", "Модель не успела ответить.", detail, status)
@@ -167,7 +177,8 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
         if "upstream" in text or meta.get("provider_name"):
             return ApiError("upstream", f"Провайдер этой модели сейчас перегружен (это общий лимит "
                             f"для всех пользователей {name}, а не твой).", detail, status)
-        return ApiError("minute_limit", "Слишком много запросов подряд. Подожди минуту.",
+        limit = " (бесплатный лимит NVIDIA — около 40 запросов в минуту)" if provider == "nvidia" else ""
+        return ApiError("minute_limit", f"Слишком много запросов подряд{limit}. Подожди минуту.",
                         detail, status, reset_ms)
     if status is not None and status >= 500:
         return ApiError("server", "Сбой на стороне провайдера модели.", detail, status)
@@ -310,21 +321,28 @@ def ask_with_fallback(provider: str, api_key: str, models: list, png_bytes: byte
         _check_cancel(req)
         if on_try and i > 0:
             on_try(model)
+        def text_payload():
+            nonlocal ocr_text
+            if ocr_text is None:
+                if on_status:
+                    on_status("Распознаю текст на скриншоте…")
+                ocr_text = _recognize_text(png_bytes)  # оригинал: в высоком разрешении читается лучше
+                _check_cancel(req)
+            if on_status:
+                on_status(f"Модель: {model} (по распознанному тексту)")
+            return build_payload(provider, model, text=ocr_text)
+
         try:
             if has_vision(provider, model):
                 if small_png is None:
                     small_png = downscale_png(png_bytes)
-                payload = build_payload(provider, model, png_bytes=small_png)
-            else:
-                if ocr_text is None:
-                    if on_status:
-                        on_status("Распознаю текст на скриншоте…")
-                    ocr_text = _recognize_text(png_bytes)  # оригинал: в высоком разрешении читается лучше
-                    _check_cancel(req)
-                    if on_status:
-                        on_status(f"Модель: {model} (по распознанному тексту)")
-                payload = build_payload(provider, model, text=ocr_text)
-            return _ask_once(provider, api_key, payload, req), model
+                try:
+                    return _ask_once(provider, api_key, build_payload(provider, model, png_bytes=small_png), req), model
+                except ApiError as e:
+                    if e.kind != "no_vision":
+                        raise
+                    # Модель не приняла картинку — отправляем ей распознанный текст.
+            return _ask_once(provider, api_key, text_payload(), req), model
         except ApiError as e:
             e.source = name
             last_error = e
@@ -342,6 +360,8 @@ def check_key(provider: str, api_key: str) -> dict:
         return {"valid": False, "error": "Ключ не указан"}
     if provider == "teamorouter":
         return _check_teamo_key(api_key)
+    if provider == "nvidia":
+        return _check_nvidia_key(api_key)
     try:
         resp = requests.get(OPENROUTER_KEY_URL, headers=_headers(provider, api_key), timeout=20)
     except requests.RequestException as e:
@@ -391,6 +411,23 @@ def _check_teamo_key(api_key: str) -> dict:
     return {"valid": True, "free_ok": probe.status_code == 200}
 
 
+def _check_nvidia_key(api_key: str) -> dict:
+    # Список моделей NVIDIA открыт всем, поэтому ключ проверяем крошечным запросом к DeepSeek.
+    try:
+        resp = requests.post(PROVIDERS["nvidia"]["chat_url"], headers=_headers("nvidia", api_key), timeout=30,
+                             json={"model": NVIDIA_PROBE_MODEL, "max_tokens": 1,
+                                   "messages": [{"role": "user", "content": "1"}]})
+    except requests.RequestException as e:
+        return {"valid": None, "error": f"Нет соединения: {e}"}
+    if resp.status_code in (401, 403):
+        return {"valid": False, "error": "Неверный ключ"}
+    if resp.status_code == 429:
+        return {"valid": True, "rate_limited": True}
+    if resp.status_code == 200:
+        return {"valid": True, "deepseek_ok": True}
+    return {"valid": True, "probe_status": resp.status_code}
+
+
 def describe_key(info: dict) -> str:
     if info.get("valid") is False:
         return f"✗ {info.get('error', 'Неверный ключ')}"
@@ -401,6 +438,12 @@ def describe_key(info: dict) -> str:
         parts.append("⚠ на балансе 0 — даже free-модели не ответят, пока баланс не пополнен")
     elif info.get("free_ok"):
         parts.append("бесплатные модели отвечают")
+    elif info.get("deepseek_ok"):
+        parts.append("DeepSeek отвечает")
+    elif info.get("rate_limited"):
+        parts.append("⚠ сейчас лимит запросов — подожди минуту")
+    elif info.get("probe_status"):
+        parts.append(f"⚠ пробный запрос к DeepSeek вернул код {info['probe_status']}")
     used, limit, remaining = info.get("used"), info.get("limit"), info.get("remaining")
     if remaining is None and used is not None and limit is not None:
         remaining = max(0, limit - used)
@@ -430,10 +473,15 @@ def fetch_models(provider: str, api_key: str = "") -> list:
             modalities = (m.get("architecture") or {}).get("input_modalities") or []
             if model_id.endswith(":free") and "image" in modalities:
                 result.append(model_id)
+        elif provider == "nvidia":
+            if not any(w in model_id.lower() for w in _NVIDIA_NOT_CHAT):
+                result.append(model_id)
         elif model_id.endswith("-free") or has_vision(provider, model_id):
             result.append(model_id)
     if provider == "openrouter":
         return sorted(result)
+    if provider == "nvidia":  # сначала DeepSeek, потом модели со зрением, потом остальные
+        return sorted(result, key=lambda mid: ("deepseek" not in mid, not has_vision(provider, mid), mid))
     return sorted(result, key=lambda mid: (not mid.endswith("-free"), mid))  # бесплатные сверху
 
 
