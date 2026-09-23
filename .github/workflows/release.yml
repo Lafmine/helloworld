@@ -1,0 +1,91 @@
+name: Build and release ZhukoGPT
+
+# Релиз публикуется для версии из zhukogpt/config.py (VERSION). Повторный пуш той же
+# версии обновляет файлы релиза; для нового релиза подними VERSION.
+on:
+  push:
+    branches: [main, claude/zhukogpt-ai-assistant-flzt2a]
+    tags: ["v*"]
+    paths-ignore: [".gitignore", ".gitattributes"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Check sources
+        shell: pwsh
+        run: python -m py_compile ZhukoGPT.py make_icon.py make_test_image.py (Get-ChildItem zhukogpt/*.py)
+
+      - name: Draw icon
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python make_icon.py
+
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path zhukogpt/config.py -Pattern '^VERSION = "(.+)"').Matches[0].Groups[1].Value
+          "tag=v$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm --onefile --noconsole --collect-all winrt --name ZhukoGPT --icon assets/zhukogpt.ico ZhukoGPT.py
+
+      # Распознавание текста проверяется в собранном exe: пакеты winrt должны попасть внутрь.
+      # Код 2 = в Windows раннера нет языков OCR (только предупреждение), остальное — ошибка сборки.
+      - name: OCR self-test
+        shell: pwsh
+        run: |
+          python make_test_image.py "$PWD/ocr_test.png"
+          if ($LASTEXITCODE -ne 0) { "::error::Не удалось нарисовать тестовую картинку"; exit 1 }
+          python ZhukoGPT.py --ocr-selftest "$PWD/ocr_test.png" "$PWD/ocr_py.txt"
+          "--- python:"; Get-Content ocr_py.txt
+          $p = Start-Process -FilePath "$PWD/dist/ZhukoGPT.exe" -ArgumentList "--ocr-selftest", "`"$PWD/ocr_test.png`"", "`"$PWD/ocr_exe.txt`"" -Wait -PassThru
+          "--- exe (код $($p.ExitCode)):"; Get-Content ocr_exe.txt
+          if ($p.ExitCode -eq 2) { "::warning::На раннере нет языков OCR, распознавание не проверено"; exit 0 }
+          if ($p.ExitCode -ne 0) { "::error::OCR в exe не работает"; exit 1 }
+          if (-not (Select-String -Path ocr_exe.txt -Pattern "17" -Quiet)) { "::error::OCR не распознал тестовый текст"; exit 1 }
+          exit 0
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist/ZhukoGPT.exe release/
+          Copy-Item README.md release/
+          Compress-Archive -Path release/* -DestinationPath ZhukoGPT-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZhukoGPT-windows
+          path: |
+            dist/ZhukoGPT.exe
+            ZhukoGPT-windows.zip
+
+      # Тег v* публикует релиз с этим тегом; пуш в ветку сам создаёт тег v<VERSION>.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ZhukoGPT ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || steps.version.outputs.tag }}
+          make_latest: true
+          body_path: .github/release-notes.md
+          files: |
+            dist/ZhukoGPT.exe
+            ZhukoGPT-windows.zip
