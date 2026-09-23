@@ -16,6 +16,13 @@ def main():
     p.drawText(30, 80, "Question 3: What is 17 x 3 + 9?")
     p.drawText(30, 160, "A) 51    B) 60    C) 69    D) 42")
     p.end()
+    # Если шрифты не нашлись, картинка останется белой — тогда проверять OCR бессмысленно.
+    dark = sum(1 for y in range(0, img.height(), 2) for x in range(0, img.width(), 2)
+               if QColor(img.pixel(x, y)).lightness() < 128)
+    print(f"test image {img.width()}x{img.height()}, dark pixels (every 2nd): {dark}")
+    if dark < 200:
+        print("text was not drawn (no fonts?)")
+        return 1
     return 0 if img.save(sys.argv[1]) else 1
 
 
