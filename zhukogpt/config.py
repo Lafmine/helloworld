@@ -5,10 +5,35 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 # Сервисы с API, совместимым с OpenAI. Ключи пользователь вводит в настройках, здесь их нет.
 PROVIDERS = {
+    "groq": {
+        "name": "Groq (бесплатно)",
+        "chat_url": "https://api.groq.com/openai/v1/chat/completions",
+        "models_url": "https://api.groq.com/openai/v1/models",
+        "keys_page": "https://console.groq.com/keys",
+        "key_placeholder": "gsk_…",
+        "default_models": [
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+        ],
+    },
+    "gemini": {
+        "name": "Google Gemini (бесплатно)",
+        "chat_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "models_url": "https://generativelanguage.googleapis.com/v1beta/openai/models",
+        "keys_page": "https://aistudio.google.com/apikey",
+        "key_placeholder": "AIza…",
+        "default_models": [
+            "gemini-3.5-flash",
+            "gemini-3.8-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+        ],
+    },
     "nvidia": {
         "name": "NVIDIA (бесплатно)",
         "chat_url": "https://integrate.api.nvidia.com/v1/chat/completions",
@@ -51,7 +76,7 @@ PROVIDERS = {
         ],
     },
 }
-DEFAULT_PROVIDER = "nvidia"
+DEFAULT_PROVIDER = "groq"
 DEFAULT_MODELS = PROVIDERS["openrouter"]["default_models"]  # для совместимости
 
 _ANSWER_FORMAT = (

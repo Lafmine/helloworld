@@ -1,4 +1,4 @@
-"""Запросы к ИИ-сервисам (NVIDIA, OpenRouter, TeamoRouter) — все совместимы с API OpenAI."""
+"""Запросы к ИИ-сервисам (Groq, Gemini, NVIDIA, OpenRouter, TeamoRouter) — все совместимы с API OpenAI."""
 import base64
 import json
 import threading
@@ -23,6 +23,10 @@ MAX_IMAGE_SIDE = 1600
 
 _EXCLUDE_WORDS = ("safety", "guard")
 NVIDIA_PROBE_MODEL = "deepseek-ai/deepseek-v4.1-flash"
+GROQ_PROBE_MODEL = "qwen/qwen3.8-27b"
+_GROQ_VISION_WORDS = ("qwen3.8", "vision", "-vl", "scout", "maverick")
+_GROQ_NOT_CHAT = ("whisper", "orpheus", "guard", "safeguard", "allam", "tts", "distil")
+_GEMINI_NOT_CHAT = ("embedding", "tts", "image", "live", "audio", "aqa", "robotics", "computer-use")
 # Модели каталога NVIDIA, которые принимают картинки (по их карточкам на build.nvidia.com).
 _NVIDIA_VISION_WORDS = ("deepseek-v4.1-flash", "gemma-4", "omni", "phi-3-vision", "phi-4-multimodal")
 # Всё, что в каталоге NVIDIA не является чат-моделью.
@@ -60,6 +64,10 @@ def has_vision(provider: str, model: str) -> bool:
     if provider == "openrouter":
         return True  # в списке OpenRouter только модели с картинками
     name = model.lower()
+    if provider == "gemini":
+        return name.startswith("gemini")  # все Gemini Flash мультимодальные
+    if provider == "groq":
+        return any(w in name for w in _GROQ_VISION_WORDS)
     if provider == "nvidia" and any(w in name for w in _NVIDIA_VISION_WORDS):
         return True
     return "vision" in name or "-vl" in name or name.endswith("vl")
@@ -151,7 +159,7 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
         return ApiError("balance", f"На балансе {name} нет денег. Даже бесплатные (free) модели там работают "
                         f"только при ненулевом балансе. Пополнить: {PROVIDERS[provider]['keys_page']}",
                         detail, status)
-    if status == 401:
+    if status == 401 or (status == 400 and "api key" in text and ("valid" in text or "invalid" in text)):
         return ApiError("auth", f"Неверный API-ключ {name}. Проверь его в настройках ⚙ (кнопка «Проверить»).",
                         detail, status)
     if status == 402:
@@ -160,7 +168,8 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
                         detail, status)
     if status == 403:
         return ApiError("other", f"{name} отклонил запрос (модерация или ограничения ключа).", detail, status)
-    if status in (400, 415, 422) and any(w in text for w in ("image", "multimodal", "vision")):
+    if status in (400, 415, 422) and any(w in text for w in ("image", "multimodal", "vision",
+                                                            "content must be a string")):
         return ApiError("no_vision", "Модель не принимает картинки.", detail, status)
     if status == 404:
         return ApiError("unavailable", "Модель сейчас недоступна.", detail, status)
@@ -177,7 +186,12 @@ def classify_error(status, error: dict, headers=None, provider="openrouter") -> 
         if "upstream" in text or meta.get("provider_name"):
             return ApiError("upstream", f"Провайдер этой модели сейчас перегружен (это общий лимит "
                             f"для всех пользователей {name}, а не твой).", detail, status)
-        limit = " (бесплатный лимит NVIDIA — около 40 запросов в минуту)" if provider == "nvidia" else ""
+        limit = {
+            "nvidia": " (бесплатный лимит NVIDIA — около 40 запросов в минуту)",
+            "groq": " (бесплатный лимит Groq: 1000 запросов в день и 8000 токенов в минуту — "
+                    "примерно 7 скриншотов в минуту)",
+            "gemini": " (бесплатный лимит Gemini)",
+        }.get(provider, "")
         return ApiError("minute_limit", f"Слишком много запросов подряд{limit}. Подожди минуту.",
                         detail, status, reset_ms)
     if status is not None and status >= 500:
@@ -264,6 +278,8 @@ def _ask_once(provider: str, api_key: str, payload: dict, req=None) -> str:
         data = json.loads(body_text)
     except ValueError:
         data = None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        data = data[0]  # Gemini иногда оборачивает ответ с ошибкой в список
     if resp.status_code != 200:
         error = (data or {}).get("error") if isinstance(data, dict) else None
         if not isinstance(error, dict):
@@ -362,6 +378,8 @@ def check_key(provider: str, api_key: str) -> dict:
         return _check_teamo_key(api_key)
     if provider == "nvidia":
         return _check_nvidia_key(api_key)
+    if provider in ("groq", "gemini"):
+        return _check_listed_key(provider, api_key)
     try:
         resp = requests.get(OPENROUTER_KEY_URL, headers=_headers(provider, api_key), timeout=20)
     except requests.RequestException as e:
@@ -411,6 +429,37 @@ def _check_teamo_key(api_key: str) -> dict:
     return {"valid": True, "free_ok": probe.status_code == 200}
 
 
+def _check_listed_key(provider: str, api_key: str) -> dict:
+    """Groq и Gemini отдают список моделей только с рабочим ключом — по нему и проверяем."""
+    headers = _headers(provider, api_key)
+    try:
+        resp = requests.get(PROVIDERS[provider]["models_url"], headers=headers, timeout=20)
+    except requests.RequestException as e:
+        return {"valid": None, "error": f"Нет соединения: {e}"}
+    body = resp.text.lower()
+    if resp.status_code in (401, 403) or (resp.status_code == 400 and "api key" in body):
+        return {"valid": False, "error": "Неверный ключ"}
+    if resp.status_code != 200:
+        return {"valid": None, "error": f"{provider_name(provider)} ответил {resp.status_code}"}
+    if provider != "groq":
+        return {"valid": True}
+    # Groq показывает дневной остаток в заголовках ответа — делаем крошечный запрос.
+    try:
+        probe = requests.post(PROVIDERS["groq"]["chat_url"], headers=headers, timeout=30, json={
+            "model": GROQ_PROBE_MODEL, "max_tokens": 1, "messages": [{"role": "user", "content": "1"}]})
+    except requests.RequestException:
+        return {"valid": True}
+    info = {"valid": True}
+    try:
+        info["limit"] = int(probe.headers["x-ratelimit-limit-requests"])
+        info["remaining"] = int(probe.headers["x-ratelimit-remaining-requests"])
+    except (KeyError, ValueError):
+        pass
+    if probe.status_code == 429:
+        info["rate_limited"] = True
+    return info
+
+
 def _check_nvidia_key(api_key: str) -> dict:
     # Список моделей NVIDIA открыт всем, поэтому ключ проверяем крошечным запросом к DeepSeek.
     try:
@@ -448,7 +497,7 @@ def describe_key(info: dict) -> str:
     if remaining is None and used is not None and limit is not None:
         remaining = max(0, limit - used)
     if remaining is not None and limit is not None:
-        parts.append(f"бесплатных запросов сегодня осталось: {remaining} из {limit}")
+        parts.append(f"запросов на сегодня осталось: {remaining} из {limit}")
     elif limit is not None:
         parts.append(f"лимит бесплатных запросов: {limit} в день")
     if info.get("key_limit_remaining") == 0:
@@ -459,10 +508,12 @@ def describe_key(info: dict) -> str:
 def fetch_models(provider: str, api_key: str = "") -> list:
     """Актуальный список подходящих моделей: бесплатные (и со зрением у TeamoRouter)."""
     info = PROVIDERS[provider]
+    if not api_key and provider in ("groq", "gemini", "teamorouter"):
+        raise RuntimeError("сначала вставь API-ключ выше")  # список моделей отдают только с ключом
     headers = _headers(provider, api_key) if api_key else {}
     resp = requests.get(info["models_url"], headers=headers, timeout=30)
-    if resp.status_code == 401:
-        raise RuntimeError("нужен рабочий API-ключ")
+    if resp.status_code in (401, 403) or (resp.status_code == 400 and "api key" in resp.text.lower()):
+        raise RuntimeError("нужен рабочий API-ключ — вставь его выше")
     resp.raise_for_status()
     result = []
     for m in resp.json().get("data", []):
@@ -476,10 +527,19 @@ def fetch_models(provider: str, api_key: str = "") -> list:
         elif provider == "nvidia":
             if not any(w in model_id.lower() for w in _NVIDIA_NOT_CHAT):
                 result.append(model_id)
+        elif provider == "groq":
+            if m.get("active", True) and not any(w in model_id.lower() for w in _GROQ_NOT_CHAT):
+                result.append(model_id)
+        elif provider == "gemini":
+            model_id = model_id.removeprefix("models/")
+            if model_id.startswith("gemini") and not any(w in model_id for w in _GEMINI_NOT_CHAT):
+                result.append(model_id)
         elif model_id.endswith("-free") or has_vision(provider, model_id):
             result.append(model_id)
     if provider == "openrouter":
         return sorted(result)
+    if provider in ("groq", "gemini"):  # сверху модели со зрением (у Gemini — flash)
+        return sorted(result, key=lambda mid: (not has_vision(provider, mid), "flash" not in mid, mid))
     if provider == "nvidia":  # сначала DeepSeek, потом модели со зрением, потом остальные
         return sorted(result, key=lambda mid: ("deepseek" not in mid, not has_vision(provider, mid), mid))
     return sorted(result, key=lambda mid: (not mid.endswith("-free"), mid))  # бесплатные сверху
