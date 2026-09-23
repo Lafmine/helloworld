@@ -4,7 +4,7 @@ import time
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMenu, QPushButton, QSizeGrip, QTextBrowser, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QSizeGrip, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 from . import winapi
@@ -24,6 +24,17 @@ QPushButton#icon, QPushButton#close {
     font-size: 12pt; min-width: 28px; min-height: 28px;
 }
 QPushButton#icon:hover { background: rgba(255,255,255,0.15); }
+QPushButton#icon:checked { background: rgba(255,200,80,0.35); border: 1px solid rgba(255,220,140,0.7); }
+QLineEdit#ask {
+    background: rgba(5,20,55,0.45); border: 1px solid rgba(160,210,255,0.3);
+    border-radius: 9px; padding: 5px 8px; selection-background-color: #3a7bff;
+}
+QLabel#batch { color: #ffe08a; font-size: 9pt; }
+QPushButton#small {
+    background: rgba(255,255,255,0.12); border: 1px solid rgba(160,210,255,0.35);
+    border-radius: 8px; padding: 3px 10px;
+}
+QPushButton#small:hover { background: rgba(255,255,255,0.22); }
 QPushButton#close:hover { background: rgba(255,80,80,0.55); }
 QPushButton#copy {
     background: rgba(255,255,255,0.12); border: 1px solid rgba(160,210,255,0.35);
@@ -58,6 +69,10 @@ class MainWindow(QWidget):
     stop_requested = Signal()
     prompt_chosen = Signal(int)
     update_requested = Signal()
+    accurate_toggled = Signal(bool)
+    followup_asked = Signal(str)
+    batch_send = Signal()
+    batch_clear = Signal()
     geometry_changed = Signal(list)
 
     def __init__(self, hide_from_capture=True):
@@ -95,9 +110,12 @@ class MainWindow(QWidget):
             "QMenu::item:selected { background: #3a7bff; }")
         self.btn_prompt.clicked.connect(
             lambda: self.prompt_menu.exec(self.btn_prompt.mapToGlobal(self.btn_prompt.rect().bottomLeft())))
+        self.btn_accurate = QPushButton("🎯", objectName="icon")
+        self.btn_accurate.setCheckable(True)
+        self.btn_accurate.toggled.connect(self._accurate_clicked)
         btn_settings = QPushButton("⚙", objectName="icon", toolTip="Настройки")
         btn_close = QPushButton("✕", objectName="close", toolTip="Выход")
-        for b in (self.btn_prompt, btn_settings, btn_close):
+        for b in (self.btn_accurate, self.btn_prompt, btn_settings, btn_close):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
         btn_settings.clicked.connect(self.settings_requested)
@@ -105,6 +123,7 @@ class MainWindow(QWidget):
         header.addWidget(logo)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.btn_accurate)
         header.addWidget(self.btn_prompt)
         header.addWidget(btn_settings)
         header.addWidget(btn_close)
@@ -116,6 +135,42 @@ class MainWindow(QWidget):
         self.view.setOpenExternalLinks(True)
         self.view.setFocusPolicy(Qt.NoFocus)
         root.addWidget(self.view, 1)
+
+        # --- куски длинного задания ---
+        self.batch_bar = QWidget()
+        batch = QHBoxLayout(self.batch_bar)
+        batch.setContentsMargins(0, 0, 0, 0)
+        batch.setSpacing(6)
+        self.batch_label = QLabel(objectName="batch")
+        btn_batch_send = QPushButton("Отправить", objectName="small")
+        btn_batch_clear = QPushButton("✕", objectName="small", toolTip="Выбросить собранные куски")
+        for b in (btn_batch_send, btn_batch_clear):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+        btn_batch_send.clicked.connect(self.batch_send)
+        btn_batch_clear.clicked.connect(self.batch_clear)
+        batch.addWidget(self.batch_label, 1)
+        batch.addWidget(btn_batch_send)
+        batch.addWidget(btn_batch_clear)
+        self.batch_bar.hide()
+        root.addWidget(self.batch_bar)
+
+        # --- уточняющий вопрос ---
+        self.ask_bar = QWidget()
+        ask = QHBoxLayout(self.ask_bar)
+        ask.setContentsMargins(0, 0, 0, 0)
+        ask.setSpacing(6)
+        self.ask_edit = QLineEdit(objectName="ask")
+        self.ask_edit.setPlaceholderText("Спросить у ИИ… (например, «проверь ещё раз»)")
+        self.ask_edit.returnPressed.connect(self._send_followup)
+        btn_ask = QPushButton("➤", objectName="small", toolTip="Отправить вопрос (Enter)")
+        btn_ask.setCursor(Qt.PointingHandCursor)
+        btn_ask.setFocusPolicy(Qt.NoFocus)
+        btn_ask.clicked.connect(self._send_followup)
+        ask.addWidget(self.ask_edit, 1)
+        ask.addWidget(btn_ask)
+        self.ask_bar.hide()
+        root.addWidget(self.ask_bar)
 
         # --- низ ---
         bottom = QHBoxLayout()
@@ -205,6 +260,34 @@ class MainWindow(QWidget):
     def mouseReleaseEvent(self, e):
         self._drag_offset = None
 
+    # --- точный режим, куски, уточнения ---
+    def set_accurate(self, on):
+        self.btn_accurate.blockSignals(True)
+        self.btn_accurate.setChecked(on)
+        self.btn_accurate.blockSignals(False)
+        self.btn_accurate.setToolTip("Точный режим: ВКЛ — думает дольше и перепроверяет" if on
+                                     else "Точный режим: выкл (нажми, чтобы ИИ думал дольше и перепроверял)")
+
+    def _accurate_clicked(self, on):
+        self.set_accurate(not on)  # состояние меняет main после предупреждения
+        self.accurate_toggled.emit(on)
+
+    def set_batch(self, count, limit):
+        if count:
+            self.batch_label.setText(f"📎 Собрано кусков: {count} из {limit}")
+        self.batch_bar.setVisible(bool(count))
+
+    def show_ask(self, visible):
+        self.ask_bar.setVisible(visible)
+        if visible:
+            self.ask_edit.clear()
+
+    def _send_followup(self):
+        question = self.ask_edit.text().strip()
+        if question:
+            self.ask_edit.clear()
+            self.followup_asked.emit(question)
+
     # --- обновление ---
     def show_update(self, version):
         self.btn_update.setText(f"⬆ {version}")
@@ -243,6 +326,8 @@ class MainWindow(QWidget):
         self._tick_busy()
 
     def _set_busy_buttons(self, busy):
+        if busy:
+            self.ask_bar.hide()
         self.btn_copy.setVisible(not busy)
         self.btn_stop.setVisible(busy)
         if busy:

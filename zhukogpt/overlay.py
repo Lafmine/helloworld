@@ -16,6 +16,44 @@ def grab_virtual_screen():
     return img, QRect(mon["left"], mon["top"], mon["width"], mon["height"])
 
 
+def _cursor_physical_pos():
+    """Позиция курсора в физических пикселях (как у mss). Вне Windows — None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        pt = wintypes.POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+            return pt.x, pt.y
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def image_to_png(img: QImage) -> bytes:
+    data = QByteArray()
+    buf = QBuffer(data)
+    buf.open(QIODevice.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    return bytes(data)
+
+
+def grab_screen_under_cursor() -> bytes:
+    """PNG монитора, на котором сейчас курсор (для бинда «весь экран»)."""
+    with mss.mss() as sct:
+        monitors = sct.monitors[1:] or sct.monitors[:1]
+        mon = monitors[0]
+        pos = _cursor_physical_pos()
+        if pos:
+            for m in monitors:
+                if m["left"] <= pos[0] < m["left"] + m["width"] and m["top"] <= pos[1] < m["top"] + m["height"]:
+                    mon = m
+                    break
+        shot = sct.grab(mon)
+        img = QImage(shot.bgra, shot.width, shot.height, shot.width * 4, QImage.Format_ARGB32).copy()
+    return image_to_png(img)
+
+
 class RegionSelector(QWidget):
     """Полноэкранный стоп-кадр: пользователь выделяет прямоугольник, получаем PNG."""
 
@@ -109,13 +147,9 @@ class RegionSelector(QWidget):
         src = QRect(int(sel.x() * self._sx), int(sel.y() * self._sy),
                     int(sel.width() * self._sx), int(sel.height() * self._sy))
         cropped = self._image.copy(src)
-        data = QByteArray()
-        buf = QBuffer(data)
-        buf.open(QIODevice.WriteOnly)
-        cropped.save(buf, "PNG")
-        buf.close()
+        png = image_to_png(cropped)
         self._finish()
-        self.selected.emit(bytes(data))
+        self.selected.emit(png)
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Escape:

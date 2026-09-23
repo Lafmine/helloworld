@@ -12,8 +12,8 @@ from . import config, updater
 from .api import AskWorker
 from .hotkeys import HotkeyManager
 from .logo import beetle_icon
-from .overlay import RegionSelector, grab_virtual_screen
-from .settings_dialog import SettingsDialog
+from .overlay import RegionSelector, grab_screen_under_cursor, grab_virtual_screen
+from .settings_dialog import AccurateWarningDialog, SettingsDialog
 from .window import MainWindow
 
 
@@ -21,12 +21,16 @@ class ZhukoApp:
     def __init__(self, app: QApplication):
         self.app = app
         self.cfg = config.load()
-        self.last_png = None
+        self.last_images = None  # последний отправленный скриншот (или куски) — для «повторить»
+        self.last_answer = None  # ответ с историей — для уточняющих вопросов
+        self.batch = []  # собранные куски длинного задания
         self.worker = None
         self._old_workers = []  # остановленные запросы, которые ещё дозакрываются в фоне
         self.selector = None
         self.settings_open = False
         self._was_visible = True
+        self._capture_mode = "send"
+        self._question = None  # текст уточняющего вопроса, если сейчас идёт он
 
         self.window = MainWindow(self.cfg["hide_from_capture"])
         self.window.setWindowIcon(beetle_icon())
@@ -36,9 +40,14 @@ class ZhukoApp:
         self.window.stop_requested.connect(self.stop_request)
         self.window.prompt_chosen.connect(self._choose_prompt)
         self.window.update_requested.connect(self._start_update)
+        self.window.accurate_toggled.connect(self._toggle_accurate)
+        self.window.followup_asked.connect(self.ask_followup)
+        self.window.batch_send.connect(self._send_batch)
+        self.window.batch_clear.connect(self._clear_batch)
         self._update_info = None
         self._update_worker = None
         self._update_prompt_menu()
+        self.window.set_accurate(self.cfg.get("accurate", False))
         self.window.geometry_changed.connect(self._save_geometry)
 
         self.hotkeys = HotkeyManager(app)
@@ -68,7 +77,10 @@ class ZhukoApp:
     def on_hotkey(self, action):
         if self.settings_open:
             return
-        {"screenshot": self.take_screenshot, "toggle": self.toggle_window,
+        {"screenshot": lambda: self.take_screenshot("send"),
+         "screenshot_full": self.take_full_screen,
+         "screenshot_add": lambda: self.take_screenshot("add"),
+         "toggle": self.toggle_window,
          "repeat": self.repeat, "quit": self.quit}.get(action, lambda: None)()
 
     def _show_welcome(self):
@@ -84,9 +96,12 @@ class ZhukoApp:
                       f"Промпт: **{config.active_prompt(self.cfg)['name']}** (сменить — кнопка 📝)", ""]
         lines += [
             f"- **{hk.get('screenshot', '—')}** — выделить область и решить задание",
+            f"- **{hk.get('screenshot_full', '—')}** — весь экран сразу",
+            f"- **{hk.get('screenshot_add', '—')}** — добавить кусок длинного задания "
+            f"(потом **{hk.get('screenshot', '—')}** — последний кусок и отправить)",
             f"- **{hk.get('toggle', '—')}** — показать / скрыть окно",
             f"- **{hk.get('repeat', '—')}** — повторить последний запрос",
-            f"- **{hk.get('quit', '—')}** — выход",
+            f"- 🎯 — точный режим, поле под ответом — уточнить у ИИ",
         ]
         self.window.show_message("\n".join(lines))
 
@@ -98,22 +113,43 @@ class ZhukoApp:
             self.window.show()
             self.window.raise_()
 
-    def take_screenshot(self):
-        if self.selector is not None:
-            return
-        if not config.active(self.cfg).get("api_key"):
-            self._restore_window()
-            self.window.show_error(f"Сначала вставь API-ключ {self._provider_name()} в настройках ⚙.")
-            self.open_settings()
-            return
-        # Если окно не скрыто от захвата — прячем его на время снимка.
-        must_hide = self.window.isVisible() and not self.window.capture_hidden_ok
+    def _need_key(self):
+        if config.active(self.cfg).get("api_key"):
+            return False
+        self._restore_window()
+        self.window.show_error(f"Сначала вставь API-ключ {self._provider_name()} в настройках ⚙.")
+        self.open_settings()
+        return True
+
+    def _hide_for_capture(self, then):
+        """Если окно не скрыто от захвата — прячем его на время снимка."""
         self._was_visible = self.window.isVisible()
-        if must_hide:
+        if self.window.isVisible() and not self.window.capture_hidden_ok:
             self.window.hide()
-            QTimer.singleShot(200, self._grab)
+            QTimer.singleShot(200, then)
         else:
-            self._grab()
+            then()
+
+    def take_screenshot(self, mode="send"):
+        if self.selector is not None or self._need_key():
+            return
+        self._capture_mode = mode
+        self._hide_for_capture(self._grab)
+
+    def take_full_screen(self):
+        if self.selector is not None or self._need_key():
+            return
+
+        def grab():
+            try:
+                png = grab_screen_under_cursor()
+            except Exception as e:
+                self._restore_window()
+                self.window.show_error(f"Не удалось сделать скриншот: {e}")
+                return
+            self._restore_window()
+            self._send_with_batch(png)
+        self._hide_for_capture(grab)
 
     def _grab(self):
         try:
@@ -135,7 +171,10 @@ class ZhukoApp:
     def _on_selected(self, png):
         self.selector = None
         self._restore_window()
-        self.send(png)
+        if self._capture_mode == "add":
+            self._add_to_batch(png)
+        else:
+            self._send_with_batch(png)
 
     def _on_cancelled(self):
         self.selector = None
@@ -143,33 +182,79 @@ class ZhukoApp:
             self._restore_window()
         self.window.set_status("Скриншот отменён")
 
+    # --- куски длинного задания ---
+    def _add_to_batch(self, png):
+        self.batch.append(png)
+        limit = config.MAX_BATCH_PARTS
+        if len(self.batch) >= limit:
+            self.window.set_status(f"Собрано {limit} куска — отправляю")
+            self._send_batch()
+            return
+        self.window.set_batch(len(self.batch), limit)
+        hk = self.cfg["hotkeys"]
+        self.window.set_status(f"{hk.get('screenshot_add', '')} — ещё кусок, "
+                               f"{hk.get('screenshot', '')} — последний")
+
+    def _send_with_batch(self, png):
+        if self.batch:
+            self.batch.append(png)
+            self._send_batch()
+        else:
+            self.send([png])
+
+    def _send_batch(self):
+        if self.batch:
+            images, self.batch = self.batch, []
+            self.window.set_batch(0, config.MAX_BATCH_PARTS)
+            self.send(images)
+
+    def _clear_batch(self):
+        self.batch = []
+        self.window.set_batch(0, config.MAX_BATCH_PARTS)
+        self.window.set_status("Куски выброшены")
+
+    # --- запросы ---
     def repeat(self):
-        if self.last_png is None:
+        if self.last_images is None:
             self.window.set_status("Повторять нечего — сначала сделай скриншот")
             return
         if not self.window.isVisible():
             self.window.show()
-        self.send(self.last_png)
+        self.send(self.last_images)
 
-    def send(self, png):
+    def _busy(self):
         if self.worker is not None and self.worker.isRunning():
-            self.window.set_status("Ещё думаю над прошлым скриншотом — подожди или нажми «Стоп»")
+            self.window.set_status("Ещё думаю над прошлым запросом — подожди или нажми «Стоп»")
+            return True
+        return False
+
+    def _start_worker(self, worker, model):
+        self.window.set_busy(model, note="🎯 точный режим" if self.cfg.get("accurate") else "")
+        self.worker = worker
+        worker.trying.connect(self._on_trying)
+        worker.status.connect(self.window.set_busy_status)
+        worker.finished_ok.connect(self._on_answer)
+        worker.failed.connect(self._on_error)
+        worker.cancelled.connect(self._on_cancelled_request)
+        worker.start()
+
+    def send(self, images):
+        if self._busy():
             return
-        self.last_png = png
-        current = config.active(self.cfg)
-        model = current["model"]
-        # Выбранная модель первой, остальные из списка — запасные при перегрузке провайдера.
-        models = [model] + [m for m in current.get("models", []) if m != model]
-        self.window.set_busy(model)
+        self.last_images = images
+        services = config.services_order(self.cfg)
         prompt = config.active_prompt(self.cfg)
-        self.worker = AskWorker(self.cfg["provider"], current.get("api_key", ""), models, png,
-                                prompt_text=prompt["text"])
-        self.worker.trying.connect(self._on_trying)
-        self.worker.status.connect(self.window.set_busy_status)
-        self.worker.finished_ok.connect(self._on_answer)
-        self.worker.failed.connect(self._on_error)
-        self.worker.cancelled.connect(self._on_cancelled_request)
-        self.worker.start()
+        self._question = None
+        self._start_worker(AskWorker(services, images, prompt_text=prompt["text"],
+                                     accurate=self.cfg.get("accurate", False)), services[0][2][0])
+
+    def ask_followup(self, question):
+        if self.last_answer is None or self._busy():
+            return
+        key = self.cfg["providers"][self.last_answer.provider].get("api_key", "")
+        self._question = question
+        self._start_worker(AskWorker(followup=(self.last_answer, key, question),
+                                     accurate=self.cfg.get("accurate", False)), self.last_answer.model)
 
     def stop_request(self):
         worker = self.worker
@@ -188,6 +273,7 @@ class ZhukoApp:
         self.window.show_message("Запрос остановлен. Можно сделать новый скриншот или нажать "
                                  f"**{self.cfg['hotkeys'].get('repeat', '')}**, чтобы повторить.")
         self.window.set_status(self._ready_text())
+        self.window.show_ask(self.last_answer is not None)
 
     def _provider_name(self):
         return config.PROVIDERS[self.cfg["provider"]]["name"]
@@ -195,13 +281,34 @@ class ZhukoApp:
     def _on_trying(self, model):
         self.window.set_busy(model, note="прошлая модель занята, пробую другую")
 
-    def _on_answer(self, text, model):
+    def _on_answer(self, answer):
+        self.last_answer = answer
+        text = answer.text
+        if self._question:
+            text = f"> {self._question}\n\n{text}"
         self.window.show_answer(text)
-        self.window.set_status(f"Готово • {model.split('/')[-1]}")
+        service = config.PROVIDERS[answer.provider]["name"].split(" (")[0]
+        switched = "" if answer.provider == self.cfg["provider"] else " (основной сервис не ответил)"
+        self.window.set_status(f"Готово • {answer.model.split('/')[-1]} • {service}{switched}")
+        self.window.show_ask(True)
 
     def _on_error(self, text):
         self.window.show_error(text)
         self.window.set_status(self._ready_text())
+        self.window.show_ask(self.last_answer is not None and self._question is not None)
+
+    # --- точный режим ---
+    def _toggle_accurate(self, on):
+        if on and not self.cfg.get("accurate_warned"):
+            dlg = AccurateWarningDialog(self.window, self.cfg.get("hide_from_capture", True))
+            if not dlg.exec():
+                return  # передумал — режим остаётся выключенным
+            self.cfg["accurate_warned"] = True
+        self.cfg["accurate"] = on
+        config.save(self.cfg)
+        self.window.set_accurate(on)
+        self.window.set_status("🎯 Точный режим включён: ответы дольше, но внимательнее" if on
+                               else "Точный режим выключен")
 
     # --- настройки ---
     def open_settings(self):
@@ -220,7 +327,7 @@ class ZhukoApp:
             self.window.apply_window_flags()
             self._update_prompt_menu()
         self._register_hotkeys()
-        if accepted and self.last_png is None:
+        if accepted and self.last_images is None:
             self._show_welcome()  # обновить подсказки с новыми биндами
 
     # --- обновление ---
@@ -271,7 +378,7 @@ class ZhukoApp:
         self._update_prompt_menu()
         name = config.active_prompt(self.cfg)["name"]
         self.window.set_status(f"Промпт: {name} • {self.cfg['hotkeys'].get('screenshot', '')} — скриншот")
-        if self.last_png is None:
+        if self.last_images is None:
             self._show_welcome()
 
     def _save_geometry(self, geometry):

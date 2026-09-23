@@ -2,10 +2,10 @@
 import copy
 import html
 
-from PySide6.QtCore import QRectF, Qt
+from PySide6.QtCore import QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QKeySequence, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QKeySequenceEdit, QLabel,
+    QCheckBox, QComboBox, QDialog, QFormLayout, QHBoxLayout, QKeySequenceEdit, QLabel, QLayout,
     QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout,
 )
 
@@ -37,6 +37,7 @@ QPushButton {
 QPushButton:hover { background: rgba(255,255,255,0.22); }
 QPushButton#primary { background: #2f6bff; border-color: #6f9bff; }
 QPushButton#primary:hover { background: #4a80ff; }
+QPushButton#primary:disabled { background: rgba(47,107,255,0.35); color: rgba(234,244,255,0.55); }
 QCheckBox::indicator { width: 16px; height: 16px; }
 """
 
@@ -134,6 +135,58 @@ class PromptEditDialog(GlassDialog):
     def result_prompt(self):
         name = self.name_edit.text().strip() or self.text_edit.toPlainText().strip()[:30]
         return {"name": name, "text": self.text_edit.toPlainText().strip()}
+
+
+class AccurateWarningDialog(GlassDialog):
+    """Предупреждение при первом включении точного режима; «Я понял» доступна через 5 секунд."""
+
+    COUNTDOWN = 5
+
+    def __init__(self, parent=None, hide_from_capture=True):
+        super().__init__(parent, hide_from_capture)
+        self.setWindowTitle("Точный режим")
+        root = QVBoxLayout(self)
+        root.setSizeConstraint(QLayout.SetFixedSize)  # высота по тексту, без обрезки переносов
+        root.setContentsMargins(20, 14, 20, 16)
+        root.setSpacing(10)
+        root.addWidget(QLabel("🎯  Точный режим", objectName="title"))
+        text = QLabel(
+            "ИИ будет решать внимательнее: думать дольше и перепроверять вычисления.\n\n"
+            "⏳ Ответ может приходить заметно дольше — 10–30 секунд, иногда до полутора минут.\n"
+            "📉 Бесплатные лимиты тратятся быстрее.\n\n"
+            "Выключить можно той же кнопкой 🎯 в окне.")
+        text.setWordWrap(True)
+        text.setFixedWidth(380)
+        root.addWidget(text)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        btn_cancel = QPushButton("Отмена")
+        self.btn_ok = QPushButton(objectName="primary")
+        self.btn_ok.setEnabled(False)
+        btn_cancel.clicked.connect(self.reject)
+        self.btn_ok.clicked.connect(self.accept)
+        buttons.addWidget(btn_cancel)
+        buttons.addWidget(self.btn_ok)
+        root.addLayout(buttons)
+        self._left = self.COUNTDOWN
+        self._timer = QTimer(self, interval=1000)
+        self._timer.timeout.connect(self._tick)
+        self._update_button()
+        self._timer.start()
+
+    def _tick(self):
+        self._left -= 1
+        if self._left <= 0:
+            self._timer.stop()
+        self._update_button()
+
+    def _update_button(self):
+        if self._left > 0:
+            self.btn_ok.setText(f"Я понял ({self._left})")
+        else:
+            self.btn_ok.setText("Я понял")
+            self.btn_ok.setEnabled(True)
+            self.btn_ok.setDefault(True)
 
 
 class SettingsDialog(GlassDialog):
@@ -243,6 +296,10 @@ class SettingsDialog(GlassDialog):
         self.capture_check = QCheckBox("Скрывать окно от записи и демонстрации экрана (Discord, OBS…)")
         self.capture_check.setChecked(cfg.get("hide_from_capture", True))
         root.addWidget(self.capture_check)
+
+        self.fallback_check = QCheckBox("Лимит или сбой — сразу пробовать другие сервисы с ключами")
+        self.fallback_check.setChecked(cfg.get("fallback_services", True))
+        root.addWidget(self.fallback_check)
 
         self.update_check = QCheckBox("Проверять обновления при запуске")
         self.update_check.setChecked(cfg.get("auto_update", True))
@@ -418,6 +475,7 @@ class SettingsDialog(GlassDialog):
         self._cfg["hotkeys"] = hotkeys
         self._cfg["hide_from_capture"] = self.capture_check.isChecked()
         self._cfg["auto_update"] = self.update_check.isChecked()
+        self._cfg["fallback_services"] = self.fallback_check.isChecked()
         self._cfg["prompts"] = self._prompts
         self._cfg["active_prompt"] = self._active_prompt
         self.accept()
