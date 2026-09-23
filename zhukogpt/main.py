@@ -8,7 +8,7 @@ from PySide6.QtCore import QLockFile, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import config, updater
+from . import audio, config, updater
 from .api import AskWorker
 from .hotkeys import HotkeyManager
 from .logo import beetle_icon
@@ -31,6 +31,10 @@ class ZhukoApp:
         self._was_visible = True
         self._capture_mode = "send"
         self._question = None  # текст уточняющего вопроса, если сейчас идёт он
+        self.last_audio = None  # последняя запись Interview-режима — для «повторить»
+        self.recorder = audio.Recorder()
+        self._listen_timer = QTimer(interval=150)
+        self._listen_timer.timeout.connect(self._tick_listen)
 
         self.window = MainWindow(self.cfg["hide_from_capture"])
         self.window.setWindowIcon(beetle_icon())
@@ -44,10 +48,17 @@ class ZhukoApp:
         self.window.followup_asked.connect(self.ask_followup)
         self.window.batch_send.connect(self._send_batch)
         self.window.batch_clear.connect(self._clear_batch)
+        self.window.interview_toggled.connect(self.toggle_interview)
+        self.window.listen_clicked.connect(self.toggle_listen)
+        self.window.listen_cancel.connect(self.cancel_listen)
+        self.window.source_clicked.connect(self._next_source)
         self._update_info = None
         self._update_worker = None
         self._update_prompt_menu()
         self.window.set_accurate(self.cfg.get("accurate", False))
+        self.window.set_interview(self.cfg.get("interview", False))
+        self.window.set_source(audio.SOURCES.get(self.cfg.get("audio_source"), audio.SOURCES["loopback"]))
+        self.window.set_listen_hotkey(self.cfg["hotkeys"].get("listen", ""))
         self.window.geometry_changed.connect(self._save_geometry)
 
         self.hotkeys = HotkeyManager(app)
@@ -80,6 +91,7 @@ class ZhukoApp:
         {"screenshot": lambda: self.take_screenshot("send"),
          "screenshot_full": self.take_full_screen,
          "screenshot_add": lambda: self.take_screenshot("add"),
+         "listen": self.toggle_listen,
          "toggle": self.toggle_window,
          "repeat": self.repeat, "quit": self.quit}.get(action, lambda: None)()
 
@@ -102,6 +114,8 @@ class ZhukoApp:
             f"- **{hk.get('toggle', '—')}** — показать / скрыть окно",
             f"- **{hk.get('repeat', '—')}** — повторить последний запрос",
             f"- 🎯 — точный режим, поле под ответом — уточнить у ИИ",
+            f"- 🎧 **Interview (бета)**: **{hk.get('listen', '—')}** — слушать звук ПК или микрофон, "
+            f"ещё раз — ответить на услышанное",
         ]
         self.window.show_message("\n".join(lines))
 
@@ -215,12 +229,15 @@ class ZhukoApp:
 
     # --- запросы ---
     def repeat(self):
-        if self.last_images is None:
+        if self.last_images is None and self.last_audio is None:
             self.window.set_status("Повторять нечего — сначала сделай скриншот")
             return
         if not self.window.isVisible():
             self.window.show()
-        self.send(self.last_images)
+        if self.last_images is None:
+            self.send_audio(self.last_audio)
+        else:
+            self.send(self.last_images)
 
     def _busy(self):
         if self.worker is not None and self.worker.isRunning():
@@ -242,11 +259,114 @@ class ZhukoApp:
         if self._busy():
             return
         self.last_images = images
+        self.last_audio = None
         services = config.services_order(self.cfg)
         prompt = config.active_prompt(self.cfg)
         self._question = None
         self._start_worker(AskWorker(services, images, prompt_text=prompt["text"],
                                      accurate=self.cfg.get("accurate", False)), services[0][2][0])
+
+    def send_audio(self, wav):
+        if self._busy():
+            return
+        self.last_audio = wav
+        self.last_images = None
+        services = config.services_order(self.cfg)
+        groq_key = self.cfg["providers"]["groq"].get("api_key", "")
+        self._question = None
+        self._start_worker(AskWorker(services, audio=(wav, groq_key), accurate=self.cfg.get("accurate", False)),
+                           services[0][2][0])
+
+    # --- Interview-режим (бета) ---
+    def toggle_interview(self, on):
+        if not on and self.recorder.active:
+            self.cancel_listen()
+        self.cfg["interview"] = on
+        config.save(self.cfg)
+        self.window.set_interview(on)
+        hk = self.cfg["hotkeys"].get("listen", "")
+        self.window.set_status(f"🎧 Interview (бета): {hk} или большая кнопка — слушать" if on
+                               else "Interview-режим выключен")
+
+    def _next_source(self):
+        if self.recorder.active:
+            return
+        ids = list(audio.SOURCES)
+        current = self.cfg.get("audio_source", "loopback")
+        new = ids[(ids.index(current) + 1) % len(ids)] if current in ids else ids[0]
+        self.cfg["audio_source"] = new
+        config.save(self.cfg)
+        self.window.set_source(audio.SOURCES[new])
+        self.window.set_status("Слушаю звук компьютера (собеседник в Zoom, Discord, браузере)" if new == "loopback"
+                               else "Слушаю микрофон")
+
+    def toggle_listen(self):
+        if self.settings_open:
+            return
+        if self.recorder.active:
+            self.finish_listen()
+        else:
+            self.start_listen()
+
+    def start_listen(self):
+        if self._busy():
+            return
+        self._restore_window()
+        if not self.cfg["providers"]["groq"].get("api_key"):
+            self.window.show_error(
+                "Для Interview-режима нужен **бесплатный ключ Groq**: он расшифровывает звук (Whisper).\n\n"
+                "Открой ⚙, выбери сервис **Groq**, вставь ключ "
+                "([console.groq.com/keys](https://console.groq.com/keys)) и сохрани. "
+                "Потом можно вернуть свой основной сервис — ключ Groq останется.")
+            return
+        if not self.cfg.get("interview"):
+            self.toggle_interview(True)
+        source = self.cfg.get("audio_source", "loopback")
+        try:
+            self.recorder.start(source)
+        except audio.AudioError as e:
+            self.window.show_error(f"Не получилось начать запись: {e}")
+            return
+        hk = self.cfg["hotkeys"].get("listen", "")
+        what = "звук компьютера" if source == "loopback" else "микрофон"
+        self.window.show_message(
+            f"### 🎧 Слушаю {what}…\n\n"
+            f"Когда вопрос прозвучит до конца — нажми **{hk}** или «⏹ Ответить».\n\n"
+            f"Устройство: {self.recorder.device_name}\n\n"
+            f"Максимум {audio.MAX_SECONDS // 60} минуты, потом запись отправится сама.")
+        self.window.set_status("🎧 Идёт запись")
+        self.window.set_listening(True)
+        self._listen_timer.start()
+
+    def _tick_listen(self):
+        if not self.recorder.active:
+            self._listen_timer.stop()
+            return
+        elapsed = self.recorder.elapsed()
+        self.window.set_listening(True, elapsed, self.recorder.level)
+        if elapsed >= audio.MAX_SECONDS:
+            self.finish_listen()
+
+    def finish_listen(self):
+        self._listen_timer.stop()
+        wav = self.recorder.stop()
+        self.window.set_listening(False)
+        if wav is None:
+            source = self.cfg.get("audio_source", "loopback")
+            hint = ("Проверь, что звук собеседника идёт через динамики/наушники по умолчанию, "
+                    "или переключи источник на 🎤 микрофон." if source == "loopback" else
+                    "Проверь, что выбран нужный микрофон по умолчанию в Windows и он не выключен.")
+            self.window.show_error(f"Записалась тишина — отправлять нечего.\n\n{hint}")
+            self.window.set_status(self._ready_text())
+            return
+        self.send_audio(wav)
+
+    def cancel_listen(self):
+        self._listen_timer.stop()
+        self.recorder.cancel()
+        self.window.set_listening(False)
+        self.window.show_message("Запись выброшена.")
+        self.window.set_status(self._ready_text())
 
     def ask_followup(self, question):
         if self.last_answer is None or self._busy():
@@ -284,7 +404,9 @@ class ZhukoApp:
     def _on_answer(self, answer):
         self.last_answer = answer
         text = answer.text
-        if self._question:
+        if answer.heard:
+            text = f"> 🎧 {answer.heard}\n\n{text}"
+        elif self._question:
             text = f"> {self._question}\n\n{text}"
         self.window.show_answer(text)
         service = config.PROVIDERS[answer.provider]["name"].split(" (")[0]
@@ -326,8 +448,9 @@ class ZhukoApp:
             self.window.hide_from_capture = self.cfg["hide_from_capture"]
             self.window.apply_window_flags()
             self._update_prompt_menu()
+            self.window.set_listen_hotkey(self.cfg["hotkeys"].get("listen", ""))
         self._register_hotkeys()
-        if accepted and self.last_images is None:
+        if accepted and self.last_images is None and self.last_audio is None:
             self._show_welcome()  # обновить подсказки с новыми биндами
 
     # --- обновление ---
@@ -378,7 +501,7 @@ class ZhukoApp:
         self._update_prompt_menu()
         name = config.active_prompt(self.cfg)["name"]
         self.window.set_status(f"Промпт: {name} • {self.cfg['hotkeys'].get('screenshot', '')} — скриншот")
-        if self.last_images is None:
+        if self.last_images is None and self.last_audio is None:
             self._show_welcome()
 
     def _save_geometry(self, geometry):
@@ -386,6 +509,7 @@ class ZhukoApp:
         config.save(self.cfg)
 
     def quit(self):
+        self.recorder.cancel()
         self.hotkeys.unregister_all()
         g = self.window.geometry()
         self.cfg["geometry"] = [g.x(), g.y(), g.width(), g.height()]

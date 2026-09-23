@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 # Сервисы с API, совместимым с OpenAI. Ключи пользователь вводит в настройках, здесь их нет.
 PROVIDERS = {
@@ -141,8 +141,10 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def build_system_prompt(prompt_text: str, ocr: bool, transcript: bool = False) -> str:
+def build_system_prompt(prompt_text: str, ocr: bool, transcript: bool = False, speech: bool = False) -> str:
     """Системный промпт: вступление (скриншот, OCR-текст или переписанное задание) + задача + правила."""
+    if speech:
+        return f"{SPEECH_INTRO}\n\nЗадача:\n{prompt_text.strip()}\n\n{SPEECH_RULES}"
     intro = TRANSCRIPT_INTRO if transcript else (TEXT_INTRO if ocr else IMAGE_INTRO)
     return f"{intro}\n\nЗадача:\n{prompt_text.strip()}\n\n{COMMON_RULES}"
 
@@ -166,6 +168,29 @@ TRANSCRIPT_INTRO = (
     "Ты — ZhukoGPT, помощник. Тебе дают задание, аккуратно переписанное со скриншота "
     "(рисунки и графики описаны словами)."
 )
+# Interview-режим (бета): звук → Whisper у Groq → ответ.
+WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+WHISPER_MODEL = "whisper-large-v3-turbo"
+SPEECH_INTRO = (
+    "Ты — ZhukoGPT, помощник на собеседовании или в разговоре. Тебе дают автоматическую "
+    "расшифровку того, что сейчас прозвучало (возможны ошибки распознавания, нет пунктуации "
+    "и не указано, кто говорит). Восстанови смысл."
+)
+INTERVIEW_PROMPT = (
+    "Найди в расшифровке последний вопрос или задание, адресованные собеседнику, и помоги ответить.\n"
+    "Формат ответа:\n"
+    "1. Первой строкой — **Вопрос:** коротко, как ты его понял.\n"
+    "2. Затем **Ответ:** — готовый ответ, который можно сразу сказать вслух от первого лица: "
+    "3–6 предложений, по делу, живым разговорным языком.\n"
+    "3. Если вопрос технический — ниже 2–4 ключевых пункта списком или короткий пример кода.\n"
+    "Если вопроса нет — в одной-двух строках скажи, о чём речь, и что можно ответить."
+)
+SPEECH_RULES = (
+    "Готовый ответ пиши на том языке, на котором идёт разговор; всё остальное — по-русски.\n"
+    "Не используй LaTeX и знаки $: формулы пиши обычным текстом и символами Unicode."
+)
+USER_PROMPT_SPEECH = "Расшифровка звука:\n\n"
+
 MAX_BATCH_PARTS = 3  # сколько кусков длинного задания можно собрать в один запрос
 
 USER_PROMPT = "Вот скриншот. Выполни задачу."
@@ -176,6 +201,7 @@ HOTKEY_ACTIONS = {
     "screenshot": "Скриншот области",
     "screenshot_full": "Скриншот всего экрана",
     "screenshot_add": "Добавить кусок задания",
+    "listen": "Interview: слушать / ответить",
     "toggle": "Показать / скрыть окно",
     "repeat": "Повторить последний запрос",
     "quit": "Выход из программы",
@@ -194,6 +220,7 @@ DEFAULTS = {
         "screenshot": "Alt+Q",
         "screenshot_full": "Alt+S",
         "screenshot_add": "Alt+D",
+        "listen": "Alt+E",
         "toggle": "Alt+W",
         "repeat": "Alt+R",
         "quit": "Ctrl+Alt+Q",
@@ -204,6 +231,8 @@ DEFAULTS = {
     "fallback_services": True,  # при лимите/ошибке пробовать другие сервисы с ключами
     "accurate": False,
     "accurate_warned": False,
+    "interview": False,  # Interview-режим (бета): большая кнопка «Слушать» в окне
+    "audio_source": "loopback",  # loopback — звук компьютера, mic — микрофон
     "prompts": copy.deepcopy(DEFAULT_PROMPTS),
     "active_prompt": 0,
 }
@@ -256,7 +285,7 @@ def load() -> dict:
     if isinstance(saved.get("hotkeys"), dict):
         cfg["hotkeys"].update(saved["hotkeys"])
     for key in ("hide_from_capture", "geometry", "auto_update", "fallback_services", "accurate",
-                "accurate_warned"):
+                "accurate_warned", "interview", "audio_source"):
         if key in saved:
             cfg[key] = saved[key]
     prompts = saved.get("prompts")

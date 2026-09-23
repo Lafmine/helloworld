@@ -44,7 +44,7 @@ jobs:
           "tag=v$v" >> $env:GITHUB_OUTPUT
 
       - name: Build exe
-        run: python -m PyInstaller --noconfirm --onefile --noconsole --collect-all winrt --name ZhukoGPT --icon assets/zhukogpt.ico ZhukoGPT.py
+        run: python -m PyInstaller --noconfirm --onefile --noconsole --collect-all winrt --hidden-import pyaudiowpatch --name ZhukoGPT --icon assets/zhukogpt.ico ZhukoGPT.py
 
       # Распознавание текста проверяется в собранном exe: пакеты winrt должны попасть внутрь.
       # Код 2 = в Windows раннера нет языков OCR (только предупреждение), остальное — ошибка сборки.
@@ -60,6 +60,16 @@ jobs:
           if ($p.ExitCode -eq 2) { "::warning::На раннере нет языков OCR, распознавание не проверено"; exit 0 }
           if ($p.ExitCode -ne 0) { "::error::OCR в exe не работает"; exit 1 }
           if (-not (Select-String -Path ocr_exe.txt -Pattern "17" -Quiet)) { "::error::OCR не распознал тестовый текст"; exit 1 }
+          exit 0
+
+      # Модуль записи звука (Interview-режим) должен попасть в exe. Звуковых устройств
+      # на раннере может не быть — это не ошибка, проверяем только, что PortAudio запускается.
+      - name: Audio self-test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$PWD/dist/ZhukoGPT.exe" -ArgumentList "--audio-selftest", "`"$PWD/audio_exe.txt`"" -Wait -PassThru
+          "--- exe (код $($p.ExitCode)):"; Get-Content audio_exe.txt
+          if ($p.ExitCode -ne 0) { "::error::Модуль записи звука в exe не работает"; exit 1 }
           exit 0
 
       - name: Package

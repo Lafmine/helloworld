@@ -9,7 +9,7 @@ echo [2/3] Рисую иконку...
 python make_icon.py || goto :error
 
 echo [3/3] Собираю ZhukoGPT.exe...
-python -m PyInstaller --noconfirm --onefile --noconsole --collect-all winrt ^
+python -m PyInstaller --noconfirm --onefile --noconsole --collect-all winrt --hidden-import pyaudiowpatch ^
     --name ZhukoGPT ^
     --icon assets\zhukogpt.ico ^
     ZhukoGPT.py || goto :error

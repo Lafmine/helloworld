@@ -12,8 +12,9 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QThread, Qt, Signal
 from PySide6.QtGui import QImage
 
 from . import ocr
-from .config import (ACCURATE_ADDON, APP_NAME, DEFAULT_PROMPTS, PROVIDERS, TRANSCRIBE_PROMPT, USER_PROMPT,
-                     USER_PROMPT_TEXT, USER_PROMPT_TRANSCRIPT, build_system_prompt)
+from .config import (ACCURATE_ADDON, APP_NAME, DEFAULT_PROMPTS, INTERVIEW_PROMPT, PROVIDERS, TRANSCRIBE_PROMPT,
+                     USER_PROMPT, USER_PROMPT_SPEECH, USER_PROMPT_TEXT, USER_PROMPT_TRANSCRIPT, WHISPER_MODEL,
+                     WHISPER_URL, build_system_prompt)
 
 OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
 TEAMO_PROBE_MODEL = "deepseek-v4-flash-free"
@@ -21,6 +22,7 @@ CONNECT_TIMEOUT = 15
 READ_TIMEOUT = 20  # сколько сервер может молчать совсем без байтов
 MODEL_DEADLINE = 45  # секунд на одну модель, потом — следующая
 ACCURATE_DEADLINE = 90  # в точном режиме модель думает дольше
+WHISPER_DEADLINE = 60  # на расшифровку звука
 MAX_FALLBACKS = 2  # сколько запасных моделей пробовать после выбранной
 MAX_IMAGE_SIDE = 1600
 
@@ -39,6 +41,9 @@ _NVIDIA_VISION_WORDS = ("deepseek-v4.1-flash", "gemma-4", "omni", "phi-3-vision"
 # Всё, что в каталоге NVIDIA не является чат-моделью.
 _NVIDIA_NOT_CHAT = ("embed", "rerank", "reward", "retriever", "guard", "safety", "coder", "code-",
                     "parse", "clip", "diffusion", "vlm-embed", "nemoretriever", "pii", "translate")
+# Фразы, которые Whisper выдаёт на тишине и шуме (выучил их из субтитров).
+_WHISPER_HALLUCINATIONS = ("продолжение следует", "субтитры", "редактор субтитров", "спасибо за просмотр",
+                           "thanks for watching", "thank you for watching", "подписывайтесь на канал")
 # При этих ошибках имеет смысл попробовать другую модель.
 _RETRYABLE = {"upstream", "unavailable", "server", "timeout", "empty"}
 
@@ -93,15 +98,17 @@ def _headers(provider, api_key):
 
 def build_payload(provider: str, model: str, png_bytes: bytes = None, text: str = None,
                   prompt_text: str = None, accurate: bool = False, images: list = None,
-                  transcript: bool = False) -> dict:
+                  transcript: bool = False, speech: bool = False) -> dict:
     """Запрос с картинкой (или несколькими) либо, для моделей без зрения, с распознанным текстом."""
     prompt_text = prompt_text or DEFAULT_PROMPTS[0]["text"]
     if accurate:
         prompt_text = prompt_text.rstrip() + "\n\n" + ACCURATE_ADDON
     if text is not None:
+        prefix = USER_PROMPT_SPEECH if speech else (USER_PROMPT_TRANSCRIPT if transcript else USER_PROMPT_TEXT)
         messages = [
-            {"role": "system", "content": build_system_prompt(prompt_text, ocr=True, transcript=transcript)},
-            {"role": "user", "content": (USER_PROMPT_TRANSCRIPT if transcript else USER_PROMPT_TEXT) + text},
+            {"role": "system", "content": build_system_prompt(prompt_text, ocr=True, transcript=transcript,
+                                                              speech=speech)},
+            {"role": "user", "content": prefix + text},
         ]
     else:
         images = images or [png_bytes]
@@ -122,6 +129,10 @@ def build_payload(provider: str, model: str, png_bytes: bytes = None, text: str 
 def _apply_reasoning(payload: dict, provider: str, model: str, accurate: bool) -> None:
     """Насколько долго модель рассуждает: коротко обычно, подробно в точном режиме."""
     name = model.lower()
+    if provider == "groq" and "qwen" in name:
+        # Бесплатный Groq: не больше 1000 выходных токенов в минуту, а qwen по умолчанию может запросить
+        # 2048 — и получить отказ. С 700 проходят два запроса подряд; если нет — ответит следующая модель.
+        payload["max_tokens"] = 700
     if provider == "openrouter":
         # Текст рассуждений не попадает в ответ в обоих режимах.
         payload["reasoning"] = {"effort": "high" if accurate else "low", "exclude": True}
@@ -377,11 +388,15 @@ class Answer:
     model: str
     provider: str
     messages: list = field(default_factory=list)
+    heard: str = ""  # Interview-режим: расшифровка звука, на которую отвечала модель
 
 
 def _ask_provider(provider, api_key, models, images, on_try=None, on_status=None, req=None,
-                  prompt_text=None, accurate=False, ocr_cache=None) -> Answer:
-    """Спрашивает модели одного сервиса: первую, при временных сбоях — следующие."""
+                  prompt_text=None, accurate=False, ocr_cache=None, speech=None) -> Answer:
+    """Спрашивает модели одного сервиса: первую, при временных сбоях — следующие.
+
+    speech — расшифровка звука (Interview-режим): тогда вместо скриншота модели уходит текст.
+    """
     name = provider_name(provider)
     if not api_key:
         raise ApiError("auth", f"Не указан API-ключ {name}. Открой настройки ⚙ и вставь ключ.")
@@ -414,7 +429,13 @@ def _ask_provider(provider, api_key, models, images, on_try=None, on_status=None
 
         try:
             payload = None
-            if has_vision(provider, model):
+            if speech is not None:
+                if on_status:
+                    on_status(f"Модель: {model} (отвечаю на услышанное)")
+                payload = build_payload(provider, model, text=speech, prompt_text=prompt_text,
+                                        accurate=accurate, speech=True)
+                text = _ask_once(provider, api_key, payload, req, limit)
+            elif has_vision(provider, model):
                 if small is None:
                     small = [downscale_png(img) for img in images]
                 payload = build_payload(provider, model, images=small, prompt_text=prompt_text, accurate=accurate)
@@ -432,7 +453,8 @@ def _ask_provider(provider, api_key, models, images, on_try=None, on_status=None
         except ApiError as e:
             e.source = name
             last_error = e
-            if e.kind not in _RETRYABLE:
+            per_model_limit = e.kind == "minute_limit" and provider == "groq"  # у Groq лимиты у каждой модели свои
+            if e.kind not in _RETRYABLE and not per_model_limit:
                 break  # лимит аккаунта / баланс / ключ: другие модели этого сервиса не помогут
     if last_error.kind in _RETRYABLE and len(candidates) > 1:
         last_error.args = (f"{last_error} Пробовал модели: "
@@ -474,6 +496,8 @@ def _ask_two_step(provider, api_key, models, images, on_status=None, req=None, p
         small = [downscale_png(img) for img in images]
         payload = build_payload(provider, reader, images=small, prompt_text="-")
         payload["messages"][0]["content"] = TRANSCRIBE_PROMPT  # без правил «отвечай по-русски»
+        if "max_tokens" in payload:
+            payload["max_tokens"] = 1000  # длинное задание переписывается целиком; при лимите подождём
         transcript = _ask_patient(provider, api_key, payload, req, MODEL_DEADLINE, on_status)
     else:
         if on_status:
@@ -491,7 +515,7 @@ def _ask_two_step(provider, api_key, models, images, on_status=None, req=None, p
 
 
 def ask_services(services, images, on_try=None, on_status=None, on_service=None, req=None,
-                 prompt_text=None, accurate=False) -> Answer:
+                 prompt_text=None, accurate=False, speech=None) -> Answer:
     """Спрашивает сервисы по очереди: services = [(provider, api_key, models), …].
 
     Если сервис упёрся в лимит, не отвечает или не принял ключ — запрос уходит в следующий.
@@ -507,7 +531,13 @@ def ask_services(services, images, on_try=None, on_status=None, on_service=None,
         if i > 0 and on_service:
             on_service(provider)
         try:
-            if accurate and PROVIDERS[provider].get("reasoner"):
+            reasoner = PROVIDERS[provider].get("reasoner")
+            if speech is not None:
+                if accurate and reasoner:  # на текст сразу отвечает рассуждающая модель
+                    models = [reasoner] + [m for m in models if m != reasoner]
+                return _ask_provider(provider, api_key, models, None, on_try, on_status, req,
+                                     prompt_text, accurate, speech=speech)
+            if accurate and reasoner:
                 # Без отката на однопроходный режим: неверный «точный» ответ хуже ошибки.
                 return _ask_two_step(provider, api_key, models, images, on_status, req, prompt_text,
                                      ocr_cache)
@@ -523,6 +553,44 @@ def ask_services(services, images, on_try=None, on_status=None, on_service=None,
     if len(failures) > 1:
         last_error.args = ("Ни один сервис не ответил:\n" + "\n".join(f"- {f}" for f in failures),)
     raise last_error
+
+
+def transcribe(api_key: str, wav: bytes, req=None) -> str:
+    """Расшифровка звука через Whisper у Groq (бесплатно). Язык определяется сам."""
+    if not api_key:
+        raise ApiError("auth", "Для Interview-режима нужен бесплатный ключ Groq: он расшифровывает звук "
+                       "(Whisper). Открой ⚙, выбери сервис Groq и вставь ключ — основной сервис можно "
+                       "потом вернуть, ключ Groq сохранится.")
+    _check_cancel(req)
+    deadline = time.monotonic() + WHISPER_DEADLINE
+    try:
+        resp = requests.post(WHISPER_URL, headers=_headers("groq", api_key),
+                             files={"file": ("speech.wav", wav, "audio/wav")},
+                             data={"model": WHISPER_MODEL, "response_format": "json", "temperature": "0"},
+                             timeout=(CONNECT_TIMEOUT, WHISPER_DEADLINE), stream=True)
+    except requests.RequestException as e:
+        _check_cancel(req)
+        raise ApiError("network", f"Нет соединения с Groq: {e}")
+    if req is not None:
+        req.set(resp)
+    body = _read_body(resp, deadline, req, WHISPER_DEADLINE).decode("utf-8", errors="replace").strip()
+    try:
+        data = json.loads(body)
+    except ValueError:
+        data = None
+    if resp.status_code != 200:
+        error = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(error, dict):
+            error = {"message": body[:300]}
+        err = classify_error(resp.status_code, error, resp.headers, "groq")
+        err.source = "Groq (расшифровка звука)"
+        raise err
+    if not isinstance(data, dict):
+        raise ApiError("server", "Groq вернул непонятный ответ на расшифровку звука.")
+    text = (data.get("text") or "").strip()
+    if any(h in text.lower() for h in _WHISPER_HALLUCINATIONS) and len(text) < 80:
+        return ""  # так Whisper «слышит» тишину и шум
+    return text
 
 
 def ask_with_fallback(provider: str, api_key: str, models: list, png_bytes: bytes,
@@ -767,13 +835,14 @@ class AskWorker(QThread):
     cancelled = Signal()
 
     def __init__(self, services=None, images=None, prompt_text=None, accurate=False,
-                 followup=None, parent=None):
+                 followup=None, audio=None, parent=None):
         super().__init__(parent)
         self._services = list(services or [])
         self._images = images
         self._prompt_text = prompt_text
         self._accurate = accurate
         self._followup = followup  # (answer, api_key, question)
+        self._audio = audio  # (wav, ключ Groq) — Interview-режим
         self._req = _Request()
 
     def cancel(self):
@@ -785,6 +854,19 @@ class AskWorker(QThread):
             if self._followup:
                 answer, key, question = self._followup
                 result = ask_followup(answer, key, question, self._req, self._accurate)
+            elif self._audio:
+                wav, groq_key = self._audio
+                self.status.emit("🎧 Расшифровываю звук (Whisper)…")
+                heard = transcribe(groq_key, wav, self._req)
+                if len(heard.strip(" .,!?…")) < 2:
+                    raise ApiError("no_speech", "Не расслышал ни одного слова. Проверь источник звука "
+                                   "(🔊 звук ПК или 🎤 микрофон) и что собеседника слышно.")
+                result = ask_services(
+                    self._services, None, on_try=self.trying.emit, on_status=self.status.emit,
+                    on_service=lambda p: self.status.emit(f"{provider_name(p)}: пробую этот сервис…"),
+                    req=self._req, prompt_text=self._prompt_text or INTERVIEW_PROMPT,
+                    accurate=self._accurate, speech=heard)
+                result.heard = heard
             else:
                 result = ask_services(
                     self._services, self._images, on_try=self.trying.emit, on_status=self.status.emit,

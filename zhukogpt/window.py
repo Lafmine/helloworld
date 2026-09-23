@@ -47,6 +47,16 @@ QPushButton#stop {
 }
 QPushButton#stop:hover { background: rgba(255,90,90,0.45); }
 QPushButton#copy:disabled { color: rgba(234,244,255,0.4); }
+QPushButton#listen {
+    background: rgba(80,200,140,0.30); border: 1px solid rgba(140,240,190,0.6);
+    border-radius: 12px; padding: 9px 10px; font-size: 11pt; font-weight: 600;
+}
+QPushButton#listen:hover { background: rgba(80,200,140,0.48); }
+QPushButton#listen[recording="true"] {
+    background: rgba(255,80,80,0.40); border: 1px solid rgba(255,160,160,0.75);
+}
+QPushButton#listen[recording="true"]:hover { background: rgba(255,80,80,0.58); }
+QPushButton#listen:disabled { color: rgba(234,244,255,0.45); }
 QPushButton#update {
     background: rgba(80,200,120,0.28); border: 1px solid rgba(140,240,170,0.55);
     border-radius: 9px; padding: 5px 10px;
@@ -73,6 +83,10 @@ class MainWindow(QWidget):
     followup_asked = Signal(str)
     batch_send = Signal()
     batch_clear = Signal()
+    interview_toggled = Signal(bool)
+    listen_clicked = Signal()
+    listen_cancel = Signal()
+    source_clicked = Signal()
     geometry_changed = Signal(list)
 
     def __init__(self, hide_from_capture=True):
@@ -113,9 +127,13 @@ class MainWindow(QWidget):
         self.btn_accurate = QPushButton("🎯", objectName="icon")
         self.btn_accurate.setCheckable(True)
         self.btn_accurate.toggled.connect(self._accurate_clicked)
+        self.btn_interview = QPushButton("🎧", objectName="icon",
+                                         toolTip="Interview-режим (бета): слушать звук и отвечать")
+        self.btn_interview.setCheckable(True)
+        self.btn_interview.toggled.connect(self.interview_toggled)
         btn_settings = QPushButton("⚙", objectName="icon", toolTip="Настройки")
         btn_close = QPushButton("✕", objectName="close", toolTip="Выход")
-        for b in (self.btn_accurate, self.btn_prompt, btn_settings, btn_close):
+        for b in (self.btn_interview, self.btn_accurate, self.btn_prompt, btn_settings, btn_close):
             b.setCursor(Qt.PointingHandCursor)
             b.setFocusPolicy(Qt.NoFocus)
         btn_settings.clicked.connect(self.settings_requested)
@@ -123,6 +141,7 @@ class MainWindow(QWidget):
         header.addWidget(logo)
         header.addWidget(title)
         header.addStretch(1)
+        header.addWidget(self.btn_interview)
         header.addWidget(self.btn_accurate)
         header.addWidget(self.btn_prompt)
         header.addWidget(btn_settings)
@@ -135,6 +154,28 @@ class MainWindow(QWidget):
         self.view.setOpenExternalLinks(True)
         self.view.setFocusPolicy(Qt.NoFocus)
         root.addWidget(self.view, 1)
+
+        # --- Interview-режим: большая кнопка «Слушать» ---
+        self.listen_bar = QWidget()
+        listen = QHBoxLayout(self.listen_bar)
+        listen.setContentsMargins(0, 0, 0, 0)
+        listen.setSpacing(6)
+        self.btn_listen = QPushButton(objectName="listen")
+        self.btn_source = QPushButton(objectName="small", toolTip="Что слушать: звук компьютера или микрофон")
+        self.btn_listen_cancel = QPushButton("✕", objectName="small", toolTip="Выбросить запись")
+        for b in (self.btn_listen, self.btn_source, self.btn_listen_cancel):
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFocusPolicy(Qt.NoFocus)
+        self.btn_listen.clicked.connect(self.listen_clicked)
+        self.btn_source.clicked.connect(self.source_clicked)
+        self.btn_listen_cancel.clicked.connect(self.listen_cancel)
+        self.btn_listen_cancel.hide()
+        listen.addWidget(self.btn_listen, 1)
+        listen.addWidget(self.btn_source)
+        listen.addWidget(self.btn_listen_cancel)
+        self.listen_bar.hide()
+        self._listen_hotkey = ""
+        root.addWidget(self.listen_bar)
 
         # --- куски длинного задания ---
         self.batch_bar = QWidget()
@@ -271,6 +312,37 @@ class MainWindow(QWidget):
     def _accurate_clicked(self, on):
         self.set_accurate(not on)  # состояние меняет main после предупреждения
         self.accurate_toggled.emit(on)
+
+    # --- Interview-режим ---
+    def set_interview(self, on):
+        self.btn_interview.blockSignals(True)
+        self.btn_interview.setChecked(on)
+        self.btn_interview.blockSignals(False)
+        self.listen_bar.setVisible(on)
+
+    def set_listen_hotkey(self, hotkey):
+        self._listen_hotkey = hotkey
+        if not self.btn_listen.property("recording"):
+            self.set_listening(False)
+
+    def set_source(self, label):
+        self.btn_source.setText(label)
+
+    def set_listening(self, on, elapsed=0.0, level=0.0):
+        hk = f"  ({self._listen_hotkey})" if self._listen_hotkey else ""
+        if on:
+            bars = round(level * 6)
+            text = f"⏹ Ответить  {int(elapsed) // 60}:{int(elapsed) % 60:02d}"
+            self.set_status("🎧 Запись  " + "▮" * bars + "▯" * (6 - bars))
+        else:
+            text = f"🎙 Слушать{hk}"
+        self.btn_listen.setText(text)
+        if bool(self.btn_listen.property("recording")) != on:
+            self.btn_listen.setProperty("recording", on)
+            self.btn_listen.style().unpolish(self.btn_listen)
+            self.btn_listen.style().polish(self.btn_listen)
+        self.btn_listen_cancel.setVisible(on)
+        self.btn_source.setEnabled(not on)
 
     def set_batch(self, count, limit):
         if count:
