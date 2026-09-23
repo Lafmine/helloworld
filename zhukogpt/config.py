@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "ZhukoGPT"
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Сервисы с API, совместимым с OpenAI. Ключи пользователь вводит в настройках, здесь их нет.
 PROVIDERS = {

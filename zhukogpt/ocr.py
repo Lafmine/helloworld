@@ -1,6 +1,7 @@
 """Распознавание текста со скриншота встроенным OCR Windows (Windows.Media.Ocr)."""
 import asyncio
 import sys
+import traceback
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage
@@ -15,6 +16,10 @@ class OcrUnavailable(RuntimeError):
 
 class OcrModuleMissing(OcrUnavailable):
     """Нет пакетов winrt — значит, ошибка сборки, а не настроек Windows."""
+
+
+class OcrNoLanguages(OcrUnavailable):
+    """В Windows не установлен ни один язык для распознавания."""
 
 
 def _winrt():
@@ -55,7 +60,7 @@ async def _recognize_async(img: QImage) -> list:
     OcrEngine, SoftwareBitmap, BitmapPixelFormat, BitmapAlphaMode, DataWriter = _winrt()
     languages = list(OcrEngine.available_recognizer_languages)
     if not languages:
-        raise OcrUnavailable(
+        raise OcrNoLanguages(
             "В Windows не установлен ни один язык для распознавания текста. Добавь язык: "
             "Параметры → Время и язык → Язык и регион → Добавить язык (например, русский).")
 
@@ -90,7 +95,7 @@ def recognize(png_bytes: bytes) -> str:
     except OcrUnavailable:
         raise
     except Exception as e:
-        raise OcrUnavailable(f"Ошибка распознавания текста Windows: {e}")
+        raise OcrUnavailable(f"Ошибка распознавания текста Windows: {e}") from e
 
     variants = []
     for tag, text in results:
@@ -117,11 +122,12 @@ def selftest(png_path: str, out_path: str) -> int:
     except OcrModuleMissing as e:
         lines.append(f"MODULE MISSING: {e}")
         code = 4
-    except OcrUnavailable as e:
-        lines.append(f"UNAVAILABLE: {e}")
+    except OcrNoLanguages as e:
+        lines.append(f"NO LANGUAGES: {e}")
         code = 2
     except Exception as e:  # отчёт должен появиться в любом случае
         lines.append(f"ERROR: {type(e).__name__}: {e}")
+        lines.append(traceback.format_exc())
         code = 1
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
