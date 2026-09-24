@@ -1,0 +1,17 @@
+{
+  "name": "ZhukoGPT",
+  "short_name": "ZhukoGPT",
+  "description": "Сфоткай задание — получи ответ",
+  "lang": "ru",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#07153a",
+  "theme_color": "#0b1f4a",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icons/icon-180.png", "sizes": "180x180", "type": "image/png"}
+  ]
+}

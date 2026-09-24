@@ -4,3 +4,7 @@ build/
 dist/
 *.spec
 assets/
+
+# Веб-версия: собирается в CI (make_web_config.py, make_icon.py)
+web/config.json
+web/icons/

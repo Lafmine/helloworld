@@ -6,7 +6,7 @@ on:
   push:
     branches: [main, claude/zhukogpt-ai-assistant-flzt2a]
     tags: ["v*"]
-    paths-ignore: [".gitignore", ".gitattributes"]
+    paths-ignore: [".gitignore", ".gitattributes", "web/**", "make_web_config.py", ".github/workflows/pages.yml"]
   workflow_dispatch:
 
 permissions:

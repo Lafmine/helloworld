@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<title>ZhukoGPT</title>
+<meta name="description" content="Сфоткай задание — получи ответ">
+<meta name="theme-color" content="#0b1f4a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ZhukoGPT">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Камера: живой видоискатель и большая кнопка -->
+<section id="cam" class="screen active">
+  <video id="video" playsinline muted autoplay></video>
+  <div id="cam-error" class="cam-error hidden">
+    <div class="glass card">
+      <div class="big-emoji">📷</div>
+      <p id="cam-error-text">Нет доступа к камере.</p>
+      <label class="btn primary wide">📷 Открыть камеру iPhone
+        <input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
+      </label>
+      <button id="cam-retry" class="btn wide">↻ Попробовать ещё раз</button>
+    </div>
+  </div>
+  <header class="topbar glass">
+    <div class="brand"><img src="icons/icon-192.png" alt=""><span>ZhukoGPT</span></div>
+    <div class="actions">
+      <button id="btn-accurate" class="icon" aria-label="Точный режим" title="Точный режим">🎯</button>
+      <button id="btn-history" class="icon" aria-label="История" title="История">🕘</button>
+      <button id="btn-settings" class="icon" aria-label="Настройки" title="Настройки">⚙</button>
+    </div>
+  </header>
+  <button id="prompt-chip" class="chip glass">📝 <span id="prompt-name">Решить задание</span> ▾</button>
+  <div id="cam-hint" class="hint glass hidden"></div>
+  <footer class="shutter-row">
+    <label class="side-btn glass" aria-label="Выбрать фото из галереи" title="Из галереи">🖼
+      <input id="file-gallery" type="file" accept="image/*" hidden>
+    </label>
+    <button id="shutter" class="shutter" aria-label="Сфоткать и решить"><span></span></button>
+    <button id="btn-last" class="side-btn glass hidden" aria-label="Последний ответ" title="Последний ответ">💬</button>
+  </footer>
+</section>
+
+<!-- Ответ -->
+<section id="ans" class="screen page">
+  <header class="navbar">
+    <button id="ans-back" class="link">‹ Камера</button>
+    <span class="title">Ответ</span>
+    <span id="ans-accurate" class="badge hidden">🎯</span>
+  </header>
+  <div class="scroll">
+    <img id="ans-photo" class="photo" alt="Фото задания">
+    <div id="ans-card" class="glass card answer"></div>
+  </div>
+  <div class="ans-bottom">
+    <div id="ask-bar" class="ask-bar hidden">
+      <input id="ask-input" type="text" placeholder="Спросить у ИИ… (например, «почему так?»)" enterkeyhint="send" autocomplete="off">
+      <button id="ask-send" class="btn small" aria-label="Отправить">➤</button>
+    </div>
+    <div class="status-row">
+      <span id="ans-status" class="status"></span>
+      <button id="btn-copy" class="btn small" disabled>Копировать</button>
+      <button id="btn-stop" class="btn small danger hidden">Стоп</button>
+    </div>
+    <button id="ans-new" class="btn primary wide">📷 Новое фото</button>
+  </div>
+</section>
+
+<!-- Настройки -->
+<section id="set" class="screen page">
+  <header class="navbar">
+    <button id="set-back" class="link">‹ Готово</button>
+    <span class="title">Настройки <small id="version"></small></span>
+    <span></span>
+  </header>
+  <div class="scroll">
+    <div class="group-title">Сервис</div>
+    <div class="glass card form">
+      <select id="provider"></select>
+      <div class="row">
+        <input id="api-key" type="password" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <button id="key-eye" class="btn small" aria-label="Показать ключ">👁</button>
+      </div>
+      <div class="row">
+        <button id="key-check" class="btn small">Проверить</button>
+        <span id="key-status" class="note"></span>
+      </div>
+      <div class="note">Где взять ключ: <a id="key-link" target="_blank" rel="noopener"></a></div>
+      <label class="label">Модель</label>
+      <div class="row">
+        <select id="model"></select>
+        <button id="models-refresh" class="btn small">Обновить</button>
+      </div>
+      <div id="model-hint" class="note"></div>
+    </div>
+
+    <div class="group-title">Промпт — что ИИ делает с фото</div>
+    <div class="glass card form">
+      <select id="prompt"></select>
+      <div class="row">
+        <button id="prompt-edit" class="btn small">✎ Изменить</button>
+        <button id="prompt-new" class="btn small">+ Новый</button>
+        <button id="prompt-del" class="btn small">Удалить</button>
+      </div>
+      <div id="prompt-preview" class="note clamp"></div>
+    </div>
+
+    <div class="group-title">Ещё</div>
+    <div class="glass card form">
+      <label class="switch"><input id="fallback" type="checkbox"><span>Лимит или сбой — сразу пробовать другие сервисы с ключами</span></label>
+      <label class="switch"><input id="accurate-set" type="checkbox"><span>🎯 Точный режим: думает дольше и перепроверяет</span></label>
+    </div>
+    <p class="note center">Ключи хранятся только на этом телефоне и уходят только в выбранный сервис.<br>
+      Если удалить значок с экрана «Домой», настройки сотрутся.</p>
+  </div>
+</section>
+
+<!-- История -->
+<section id="hist" class="screen page">
+  <header class="navbar">
+    <button id="hist-back" class="link">‹ Камера</button>
+    <span class="title">История</span>
+    <button id="hist-clear" class="link">Очистить</button>
+  </header>
+  <div id="hist-list" class="scroll"></div>
+</section>
+
+<!-- Выбор промпта -->
+<div id="sheet" class="sheet-bg hidden">
+  <div class="sheet glass">
+    <div class="sheet-title">Промпт</div>
+    <div id="sheet-list"></div>
+    <button id="sheet-close" class="btn wide">Отмена</button>
+  </div>
+</div>
+
+<!-- Диалоги: предупреждение точного режима и редактор промпта -->
+<div id="modal" class="sheet-bg hidden">
+  <div class="modal glass">
+    <div id="modal-title" class="sheet-title"></div>
+    <div id="modal-body"></div>
+    <div class="row end">
+      <button id="modal-cancel" class="btn small">Отмена</button>
+      <button id="modal-ok" class="btn small primary"></button>
+    </div>
+  </div>
+</div>
+
+<canvas id="canvas" hidden></canvas>
+<script type="module" src="app.js"></script>
+</body>
+</html>
